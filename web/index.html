@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bol · Interview Coach</title>
+  <meta name="description" content="A speaking gym that interviews you on your own resume and coaches you in your own language.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <a class="brand" href="#/"><span class="dot" aria-hidden="true"></span><span><b>Bol</b><small>Interview coach</small></span></a>
+      <nav aria-label="Main">
+        <a href="#/" data-nav="practice"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Practice</a>
+        <a href="#/progress" data-nav="progress"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Progress</a>
+        <a href="#/voice" data-nav="voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 7v10M21 12h0"/></svg>My voice</a>
+        <a href="#/settings" data-nav="settings"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M2 12h3M19 12h3M4.9 19.1 7 17M17 7l2.1-2.1"/></svg>Settings</a>
+      </nav>
+      <div class="plan">
+        <span class="label">Your practice</span>
+        <div class="stats">
+          <div class="stat"><span class="num" id="plan-streak">0</span><span class="sub-label" id="plan-streak-label">day streak</span></div>
+          <div class="stat"><span class="num" id="plan-countdown">–</span><span class="sub-label" id="plan-countdown-label"><a href="#/settings">set interview date</a></span></div>
+        </div>
+        <span class="chip" id="plan-lang">Feedback: –</span>
+      </div>
+      <p class="side-foot">Listens with Gnani Prisma, speaks with Gnani Timbre, coaches with Claude.</p>
+    </aside>
+    <main class="main">
+      <span id="banner" class="example" hidden></span>
+      <div id="view" aria-live="polite"></div>
+    </main>
+  </div>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

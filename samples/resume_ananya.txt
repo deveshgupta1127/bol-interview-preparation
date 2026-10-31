@@ -1,0 +1,28 @@
+Ananya Verma
+ananya.verma@example.com | Indore, Madhya Pradesh
+
+EDUCATION
+B.Tech, Computer Science and Engineering, 2023-2027
+Shri Example Institute of Technology, Indore. CGPA 7.8
+
+SKILLS
+Python, Java, SQL, MySQL, Flask, HTML, CSS, JavaScript, Git, Data Structures
+
+PROJECTS
+Canteen Pre-Order App (Flask, MySQL)
+- Built a web app where students order canteen food before the lunch break.
+- Designed the MySQL tables for menu, orders and payments status.
+- Used by about 300 students in the second semester trial.
+
+Attendance Tracker (Python, OpenCV)
+- Developed a face-recognition attendance prototype for our class with two teammates.
+- Worked on improving accuracy of the model.
+
+EXPERIENCE
+Web Development Intern, Example Softech, Indore (May-June 2025)
+- Created landing pages for 3 client websites using HTML, CSS and JavaScript.
+- Fixed bugs reported by the QA team.
+
+ACHIEVEMENTS
+- Organised the college coding contest with 120 participants as technical club coordinator.
+- Solved 250+ problems on coding platforms.

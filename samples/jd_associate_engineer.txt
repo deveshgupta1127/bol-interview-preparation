@@ -1,0 +1,17 @@
+Associate Software Engineer (Freshers, 2027 batch)
+
+About the role
+You will join our product engineering team building REST APIs and web dashboards for retail clients.
+
+Responsibilities
+- Build and maintain backend services in Python or Java
+- Design REST APIs and write SQL queries against PostgreSQL
+- Write unit tests and take part in code reviews
+- Work with the team in Agile sprints and explain your work clearly to clients
+
+Requirements
+- Strong basics in Data Structures and algorithms
+- Python or Java, SQL
+- Familiarity with REST APIs, Git
+- Exposure to Docker or any cloud platform (AWS/Azure) is a plus
+- Good communication skills in English
