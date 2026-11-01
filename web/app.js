@@ -26,117 +26,11 @@ const sign = (d) => (d > 0 ? "+" : d < 0 ? "−" : "±") + Math.abs(d);
 const localDay = (iso) => { const d = new Date(iso); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
 const dayLabel = (day) => new Date(day + "T00:00").toLocaleDateString(undefined, { day: "numeric", month: "short" });
 
-// ---------- sign-in (Entra External ID, only when config.js sets auth) ----------
+// ---------- data ----------
+// No sign-in and no server-side storage: everything lives in this browser (web/store.js). api() keeps the same
+// /api/... paths the pages always used; the store answers from local storage and calls the server only for work.
 
-const CFG = Object.assign({ apiBase: "", auth: null }, window.BOL_CONFIG || {});
-const MSAL_URL = "https://cdn.jsdelivr.net/npm/@azure/msal-browser@4.30.0/lib/msal-browser.min.js";
-const MSAL_SRI = "sha384-RGxxfG5yRS8DLU7ZJ8OoLhbV/BsJFHyPuMVHrTLbpj3t5Z15LnviJmaznKY/a7LZ";
-let msalApp = null;
-let account = null;
-
-function loadScript(src, integrity) {
-  return new Promise((resolve, reject) => {
-    const s = Object.assign(document.createElement("script"), { src, integrity, crossOrigin: "anonymous" });
-    s.onload = resolve;
-    s.onerror = () => reject(new Error("Couldn't load sign-in. Check your connection and reload."));
-    document.head.append(s);
-  });
-}
-
-async function initAuth() {
-  if (!CFG.auth) return;
-  await loadScript(MSAL_URL, MSAL_SRI);
-  msalApp = new msal.PublicClientApplication({
-    auth: {
-      clientId: CFG.auth.clientId, authority: CFG.auth.authority, knownAuthorities: [new URL(CFG.auth.authority).host],
-      redirectUri: location.origin + "/", postLogoutRedirectUri: location.origin + "/",
-    },
-    cache: { cacheLocation: "sessionStorage" }, // tokens end with the tab
-  });
-  await msalApp.initialize();
-  const result = await msalApp.handleRedirectPromise(); // back from the sign-in page
-  account = result?.account || msalApp.getAllAccounts()[0] || null;
-}
-
-const signIn = () => msalApp.loginRedirect({ scopes: [CFG.auth.scope], redirectStartPage: location.href });
-
-// Signs out at Microsoft too (so a shared computer doesn't sign the next person straight back in) and wipes
-// everything this tab kept: tokens, cached accounts and the page's copy of the student's data.
-function signOut() {
-  if (cleanup) { cleanup(); cleanup = null; }
-  me = null;
-  view.innerHTML = '<p class="note"><span class="spinner"></span> Signing out…</p>';
-  const wipe = () => {
-    try {
-      sessionStorage.clear();
-      Object.keys(localStorage).filter((k) => k.startsWith("msal.")).forEach((k) => localStorage.removeItem(k));
-    } catch { /* storage blocked: MSAL's own logout still clears its cache */ }
-    return true; // go on to Microsoft's sign-out page
-  };
-  return msalApp.logoutRedirect({ account, onRedirectNavigate: wipe }); // runs once MSAL is done with its cache
-}
-
-// Sign out after IDLE_MINUTES without a click, key press or scroll (a tab left open in a college lab).
-// Checked every 30 s and whenever the tab comes back into view, since background timers are slowed down.
-const IDLE_MINUTES = Number(CFG.auth?.idleMinutes) || 30;
-let lastActive = Date.now();
-let idleTimer = null;
-
-function checkIdle() {
-  if (!account || Date.now() - lastActive < IDLE_MINUTES * 60000) return false;
-  clearInterval(idleTimer);
-  signOut();
-  return true;
-}
-
-function watchIdle() {
-  const active = () => { if (!checkIdle()) lastActive = Date.now(); };
-  ["pointerdown", "keydown", "wheel", "touchstart"].forEach((e) => addEventListener(e, active, { passive: true }));
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) checkIdle(); });
-  idleTimer = setInterval(checkIdle, 30000);
-}
-
-async function authHeader() {
-  if (!msalApp) return {};
-  if (!account) { await signIn(); throw new Error("Signing you in…"); }
-  try {
-    const r = await msalApp.acquireTokenSilent({ scopes: [CFG.auth.scope], account });
-    return { Authorization: "Bearer " + r.accessToken };
-  } catch (err) {
-    if (err instanceof msal.InteractionRequiredAuthError) {
-      await msalApp.acquireTokenRedirect({ scopes: [CFG.auth.scope], account, redirectStartPage: location.href });
-    }
-    throw err;
-  }
-}
-
-function signInPage() {
-  view.innerHTML = `
-    <div><h1>Practise your interview out loud</h1>
-      <p class="note">Bol asks the questions an interviewer would ask you, listens to your answer and coaches you in your own language.</p></div>
-    <div class="card" style="max-width:420px">
-      <p>Sign in with your email (we send a one-time code) or Google. Your practice stays private to your account.</p>
-      <button class="btn primary" id="sign-in" style="justify-self:start">Sign in</button>
-      <p class="note">Your recordings are analysed and never stored.</p>
-    </div>`;
-  $("#sign-in").onclick = signIn;
-}
-
-async function api(path, opts = {}) {
-  const headers = { ...(opts.headers || {}), ...(await authHeader()) };
-  const res = await fetch(CFG.apiBase + path, { ...opts, headers });
-  if (res.status === 401 && msalApp) { account = null; await signIn(); }
-  const type = res.headers.get("content-type") || "";
-  if (!res.ok) {
-    let msg = `Request failed (${res.status})`;
-    if (type.includes("json")) {
-      const body = await res.json();
-      msg = typeof body.detail === "string" ? body.detail : (body.detail?.[0]?.msg || msg);
-    }
-    throw new Error(msg);
-  }
-  return type.includes("json") ? res.json() : res;
-}
+const api = (path, opts = {}) => Store.handle(path, opts);
 const json = (method, body) => ({ method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 function flash(msg, where, kind = "") {
@@ -386,7 +280,7 @@ async function setupPage() {
           <div class="field"><label for="round">Round</label><select id="round" name="round_type">${rounds}</select></div>
           <div class="field"><label for="lang">Feedback language</label><select id="lang">${langOptions(me.feedback_language)}</select></div>
         </div>
-        <p class="note">Phone numbers, emails and links are removed before anything is saved or analysed.</p>
+        <p class="note">Phone numbers, emails and links are removed before analysis. Your practice is saved only in this browser.</p>
       </div>
       ${matchCard(null)}
     </form>
@@ -579,6 +473,9 @@ async function feedbackPage(id) {
       <a class="note" href="#/s/${a.session_id}">All questions</a></div>
     <h2>${esc(a.question.text)}</h2>
     ${(a.notes || []).map((n) => `<div class="alert">${esc(n)}</div>`).join("")}
+    <div class="card"><span class="label">${ac.speech_s ? "What you said · transcribed by Gnani Prisma" : "What you typed"}</span>
+      <div class="seg">${fillerHtml(a.transcript, L.fillers)}</div>
+      ${L.filler_count ? `<p class="note">${L.filler_count} filler${L.filler_count > 1 ? "s" : ""} highlighted.</p>` : ""}</div>
     <div class="score-row">
       <div class="card"><span class="label">Overall</span><span class="big">${sc.overall ?? "–"}</span>
         <span class="note">out of 100${delta != null ? ` · <b class="${delta >= 0 ? "up" : "down"}">${sign(delta)}</b> vs attempt ${a.previous.number}` : ""}</span></div>
@@ -616,9 +513,6 @@ async function feedbackPage(id) {
           Fill in anything in [brackets] with your real details.</p>
       </div>
     </div>
-    <div class="card"><span class="label">What you said</span>
-      <div class="seg">${fillerHtml(a.transcript, L.fillers)}</div>
-      ${L.filler_count ? `<p class="note">${L.filler_count} filler${L.filler_count > 1 ? "s" : ""} highlighted.</p>` : ""}</div>
     <div class="row">
       <a class="btn primary" href="#/q/${a.question.id}">Try again</a>
       ${a.previous ? `<a class="btn" href="#/c/${a.id}">Compare with attempt ${a.previous.number}</a>` : ""}
@@ -857,19 +751,17 @@ async function settingsPage() {
         <dt>Voices</dt><dd>${me.speech ? `Gnani Timbre · interviewer ${esc(me.interviewer_voice)}` : "Off"}</dd>
         <dt>Your voice</dt><dd>${me.has_voice_clone ? "Set up" : "Not set up"} · <a href="#/voice">manage</a></dd>
       </dl><p class="note">API keys stay on the server, never in the browser.</p></div>
-      <div class="card"><span class="label">Account</span>
-        <p>${me.sign_in ? `Signed in${me.email ? ` as <strong>${esc(me.email)}</strong>` : ""}.` : "Local mode: no sign-in, one practice account on this computer."}</p>
-        <div class="row">${me.sign_in ? '<button class="btn" id="sign-out">Sign out</button>' : ""}
-          <button class="linkbtn" id="delete-me">Delete my account and all my practice</button></div>
-        <p class="note">Deleting removes your sessions, answers, scores and voice for good.</p>
+      <div class="card"><span class="label">Your data</span>
+        <p>Everything stays in this browser: your sessions, answers, scores and voice. Bol's server keeps nothing, and there is no account.</p>
+        <p class="note">Resumes and answers are sent to the server only while they're being analysed, then forgotten. Recordings are never saved anywhere.</p>
+        <div class="row"><button class="btn" id="delete-me">Start fresh: delete everything</button></div>
+        <p class="note">Clearing this browser's site data does the same. Another browser or device starts empty.</p>
       </div>
     </div>`;
-  if (me.sign_in) $("#sign-out").onclick = signOut;
   $("#delete-me").onclick = async () => {
-    if (!confirm("Delete your account? Every session, answer, score and your cloned voice will be removed. This can't be undone.")) return;
+    if (!confirm("Delete everything Bol saved in this browser? Every session, answer, score and your cloned voice will be removed. This can't be undone.")) return;
     try {
       await api("/api/me", { method: "DELETE" });
-      if (msalApp) return signOut();
       me = null; location.hash = "#/"; route();
     } catch (err) { showError(err); }
   };
@@ -939,13 +831,5 @@ async function route() {
     view.innerHTML = `<div class="card"><p>${esc(err.message)}</p><a class="btn" href="#/" style="justify-self:start">Go to Practice</a></div>`;
   }
 }
-(async () => {
-  try { await initAuth(); } catch (err) {
-    view.innerHTML = `<div class="card"><p>${esc(err.message)}</p></div>`;
-    return;
-  }
-  if (CFG.auth && !account) return signInPage();
-  if (CFG.auth) watchIdle();
-  window.addEventListener("hashchange", route);
-  route();
-})();
+window.addEventListener("hashchange", route);
+route();

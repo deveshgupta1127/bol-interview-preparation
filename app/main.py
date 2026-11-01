@@ -1,52 +1,42 @@
 """Bol API. Run: uvicorn app.main:app --reload --port 8020
 
-Stateless: every request finds its student from the sign-in token, and every row is scoped to that student,
-so any replica can serve any request.
+Stores nothing. The browser keeps the student's sessions, answers and voice in its own storage and sends what each
+request needs; the server does the work in memory and forgets it. There is no sign-in, no database and no file
+storage. Recordings, resumes and transcripts never touch a disk.
+
+Texts the server writes (questions, feedback, better answers) come back with a signature. /api/speak only reads
+aloud signed texts, so nobody can use Bol as a free text-to-speech service on our Gnani credits.
 """
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from typing import Literal
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from sqlalchemy import delete, select, text
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field, ValidationError
 
-from . import audio, auth, claude, factcheck, gnani, language, limits, pdf, pii, scoring, tts_cache
+from . import audio, claude, factcheck, gnani, language, limits, pdf, pii, scoring
 from .config import LANGUAGES, ROUNDS, settings
-from .db import engine, get_session, init_db
-from .models import Attempt, PracticeSession, Question, UsageDaily, User, VoiceClone, utcnow
 
 log = logging.getLogger("bol")
 MAX_AUDIO_BYTES = 8 * 1024 * 1024  # 3 min of 16 kHz mono 16-bit is ~5.8 MB
-LOCAL_SUBJECT, LOCAL_EMAIL = "local", "local@bol.app"  # local mode (no AUTH_ISSUER): one built-in student
 
 if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
     # Request timings, errors and the "bol" logs go to Application Insights. Logs never carry transcripts,
-    # resume text, embeddings or tokens. Must run before FastAPI() so requests are traced.
+    # resume text or voice data. Must run before FastAPI() so requests are traced.
     from azure.monitor.opentelemetry import configure_azure_monitor
 
     configure_azure_monitor(logger_name="bol")
     log.setLevel(logging.INFO)
 
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    init_db()
-    yield
-
-
-app = FastAPI(title="Bol", lifespan=lifespan)
+app = FastAPI(title="Bol")
 
 
 def _web_headers() -> dict[str, str]:
@@ -64,8 +54,12 @@ WEB_HEADERS = _web_headers() if settings.serve_web else {}
 API_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
 
 
+def _client(request: Request) -> str:
+    return limits.client_ip(request.headers, request.client.host if request.client else None)
+
+
 @app.middleware("http")
-async def guard(request, call_next):
+async def guard(request: Request, call_next):
     """Every request: refuse huge bodies and floods from one address, then add security headers.
 
     Registered before CORS, so CORS wraps it and the browser can read these refusals too.
@@ -75,230 +69,55 @@ async def guard(request, call_next):
         length = request.headers.get("content-length", "")
         if length.isdigit() and int(length) > settings.max_request_mb * 1024 * 1024:
             return JSONResponse({"detail": "That upload is too large."}, status_code=413)
-        ip = limits.client_ip(request.headers, request.client.host if request.client else None)
-        wait = limits.per_ip.hit(ip, settings.limits.requests_per_minute_per_ip)
+        wait = limits.per_ip.hit(_client(request), settings.limits.requests_per_minute_per_ip)
         if wait:
             return JSONResponse({"detail": f"Too many requests. Wait {wait} seconds and try again."},
                                 status_code=429, headers={"Retry-After": str(wait)})
     response = await call_next(request)
     for name, value in (API_HEADERS if path.startswith("/api/") else WEB_HEADERS).items():
-        response.headers.setdefault(name, value)  # audio keeps its own Cache-Control
+        response.headers.setdefault(name, value)
     return response
 
 
 if settings.cors_origins:  # the Static Web Apps site calls the API from another origin
     app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins), allow_credentials=False,
-                       allow_methods=["GET", "POST", "PATCH", "DELETE"],
-                       allow_headers=["Authorization", "Content-Type", "Idempotency-Key"], max_age=600)
-bearer = HTTPBearer(auto_error=False)
+                       allow_methods=["GET", "POST"], allow_headers=["Content-Type", "Idempotency-Key"], max_age=600)
 
 
-def _tag_span(user_id: str) -> None:
-    try:
-        from opentelemetry import trace
+# ---------- signatures on texts Bol may read aloud ----------
 
-        trace.get_current_span().set_attribute("enduser.id", user_id)
-    except ImportError:
-        pass
+def sign(kind: str, lang: str, text: str) -> str:
+    return hmac.new(settings.signing_key, f"{kind}|{lang}|{text}".encode(), hashlib.sha256).hexdigest()[:32]
 
 
-def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer),
-                 db: Session = Depends(get_session)) -> User:
-    """The signed-in student, created on first sign-in. Local mode: the one built-in student."""
-    if settings.auth_enabled:
-        if not creds:
-            raise HTTPException(401, "Please sign in.", headers={"WWW-Authenticate": "Bearer"})
-        try:
-            subject, email, name = auth.identity(auth.verify(creds.credentials))
-        except auth.AuthError as exc:
-            raise HTTPException(exc.status, str(exc), headers={"WWW-Authenticate": "Bearer"})
-    else:
-        subject, email, name = LOCAL_SUBJECT, LOCAL_EMAIL, ""
-    user = db.scalar(select(User).where(User.auth_subject == subject))
-    if not user:
-        try:
-            user = User(auth_subject=subject, email=email, name=name, last_seen_at=utcnow())
-            db.add(user)
-            db.commit()
-        except IntegrityError:  # the same student's first two requests arrived together
-            db.rollback()
-            user = db.scalar(select(User).where(User.auth_subject == subject))
-    elif not user.last_seen_at or utcnow() - user.last_seen_at > timedelta(hours=1):
-        user.last_seen_at = utcnow()  # for purging accounts unused for 12 months
-        db.commit()
-    _tag_span(user.id)
-    return user
-
-
-# ---------- helpers ----------
-
-def _owned_session(db: Session, user: User, session_id: str) -> PracticeSession:
-    s = db.get(PracticeSession, session_id)
-    if not s or s.user_id != user.id:
-        raise HTTPException(404, "Practice session not found")
-    return s
-
-
-def _owned_question(db: Session, user: User, question_id: str) -> tuple[Question, PracticeSession]:
-    q = db.get(Question, question_id)
-    if not q:
-        raise HTTPException(404, "Question not found")
-    return q, _owned_session(db, user, q.session_id)
-
-
-def _owned_attempt(db: Session, user: User, attempt_id: str) -> tuple[Attempt, Question, PracticeSession]:
-    a = db.get(Attempt, attempt_id)
-    if not a:
-        raise HTTPException(404, "Attempt not found")
-    q, s = _owned_question(db, user, a.question_id)
-    return a, q, s
-
-
-def _questions(db: Session, session_id: str) -> list[Question]:
-    rows = db.scalars(select(Question).where(Question.session_id == session_id)).all()
-    return sorted(rows, key=lambda q: (q.position, q.kind != "main"))
-
-
-def _attempt_json(a: Attempt, previous: Attempt | None = None) -> dict:
-    out = {
-        "id": a.id, "question_id": a.question_id, "number": a.number, "transcript": a.transcript,
-        "duration_s": a.duration_s, "acoustics": a.acoustics, "language": a.language, "scores": a.scores,
-        "content": a.content, "rewrite": a.rewrite, "tips": a.tips, "native_feedback": a.native_feedback,
-        "feedback_language": a.feedback_language, "notes": a.notes, "created_at": a.created_at.isoformat() + "Z",
-    }
-    if previous:
-        out["previous"] = {"id": previous.id, "number": previous.number, "scores": previous.scores,
-                           "fillers_per_min": previous.language.get("fillers_per_min"),
-                           "wpm": previous.language.get("wpm")}
-    return out
-
-
-def _question_json(q: Question, attempts: list[Attempt]) -> dict:
-    best = max((a.scores.get("overall") or 0 for a in attempts), default=None)
-    return {"id": q.id, "position": q.position, "text": q.text, "why": q.why, "kind": q.kind,
-            "parent_id": q.parent_id, "attempts": len(attempts), "best": best,
-            "last_attempt_id": attempts[-1].id if attempts else None}
-
-
-def _place(db: Session, q: Question) -> dict:
-    """Where a question sits in its session: "Question 2 of 5" and the next main question to go to."""
-    mains = [x for x in _questions(db, q.session_id) if x.kind == "main"]
-    anchor = q.parent_id or q.id
-    idx = next((i for i, x in enumerate(mains) if x.id == anchor), 0)
-    return {"number": idx + 1, "total": len(mains),
-            "next_question_id": mains[idx + 1].id if idx + 1 < len(mains) else None}
-
-
-def _wav_response(data: bytes) -> Response:
-    return Response(content=data, media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
-
-
-def _speech(db: Session, user: User, key: str, text: str, make) -> Response:
-    """Spoken audio from the cache, or made by Gnani (counted against the limits) and then cached."""
-    cache_key = f"{user.id}/{key}.wav"
-    cached = tts_cache.get(cache_key)
-    if cached:
-        return _wav_response(cached)
-    limits.check_daily(db, user, "audio_plays")
-    limits.check_burst(user)
-    if limits.voices_paused(db):
-        raise HTTPException(503, "Voices are paused for this month. Read the text instead.")
-    db.commit()  # don't hold a database connection while Gnani works
-    try:
-        data = make()
-    except gnani.GnaniError as exc:
-        raise HTTPException(503, str(exc))
-    tts_cache.put(cache_key, data)
-    limits.record(db, user, audio_plays=1, timbre_chars=len(text))
-    db.commit()
-    return _wav_response(data)
-
-
-def _clean_key(value: str | None) -> str | None:
-    if not value:
-        return None
-    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", value):
-        raise HTTPException(422, "Idempotency-Key must be 8-64 letters, digits, - or _.")
-    return value
+def _check_signature(kind: str, lang: str, text: str, sig: str) -> None:
+    if not hmac.compare_digest(sign(kind, lang, text), sig or ""):
+        raise HTTPException(403, "Bol only reads aloud the texts it wrote. Reload the page and try again.")
 
 
 # ---------- routes ----------
 
 @app.get("/api/health")
-def health(response: Response):
-    """Liveness and readiness probe for Container Apps; also checks the database."""
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        database = True
-    except Exception as exc:
-        log.warning("health: database unreachable: %s", type(exc).__name__)
-        database = False
-        response.status_code = 503
-    return {"ok": database, "database": database, "claude": settings.claude_model if settings.claude_enabled else None,
-            "speech": gnani.enabled(), "sign_in": settings.auth_enabled}
+def health():
+    """Liveness probe for Container Apps."""
+    return {"ok": True, "claude": settings.claude_model if settings.claude_enabled else None,
+            "speech": gnani.enabled(), "stores_data": False}
 
 
-class MeUpdate(BaseModel):
-    name: str | None = None
-    feedback_language: str | None = None
-    interview_date: str | None = None  # YYYY-MM-DD, or "" to clear
+@app.get("/api/config")
+def config():
+    """What the browser needs to draw the app: languages, rounds, and which services are on or paused."""
+    return {"languages": LANGUAGES, "rounds": ROUNDS, "claude": settings.claude_enabled,
+            "claude_model": settings.claude_model, "speech": gnani.enabled(),
+            "claude_paused": limits.budget.claude_paused(), "speech_paused": limits.budget.speech_paused(),
+            "voices_paused": limits.budget.voices_paused(), "feedback_voices": sorted(gnani.FEEDBACK_VOICES),
+            "interviewer_voice": gnani.ENGLISH_VOICE, "max_typed_chars": settings.max_typed_chars}
 
 
-def _me_json(db: Session, user: User) -> dict:
-    return {"name": user.name, "feedback_language": user.feedback_language, "languages": LANGUAGES,
-            "rounds": ROUNDS, "has_voice_clone": db.get(VoiceClone, user.id) is not None,
-            "interview_date": user.interview_date.isoformat() if user.interview_date else None,
-            "claude": settings.claude_enabled, "claude_model": settings.claude_model, "speech": gnani.enabled(),
-            "claude_paused": limits.claude_paused(db), "speech_paused": limits.speech_paused(db),
-            "voices_paused": limits.voices_paused(db), "sign_in": settings.auth_enabled, "email": user.email,
-            "feedback_voices": sorted(gnani.FEEDBACK_VOICES), "interviewer_voice": gnani.ENGLISH_VOICE}
-
-
-@app.get("/api/me")
-def get_me(db: Session = Depends(get_session), user: User = Depends(current_user)):
-    return _me_json(db, user)
-
-
-@app.patch("/api/me")
-def update_me(body: MeUpdate, db: Session = Depends(get_session), user: User = Depends(current_user)):
-    if body.name is not None:
-        user.name = body.name.strip()[:80]
-    if body.feedback_language is not None:
-        if body.feedback_language not in LANGUAGES:
-            raise HTTPException(422, "Unsupported language")
-        user.feedback_language = body.feedback_language
-    if body.interview_date is not None:
-        try:
-            user.interview_date = date.fromisoformat(body.interview_date) if body.interview_date else None
-        except ValueError:
-            raise HTTPException(422, "Interview date must look like 2026-11-20")
-    db.merge(user)
-    db.commit()
-    return _me_json(db, user)
-
-
-@app.delete("/api/me", status_code=204)
-def delete_me(db: Session = Depends(get_session), user: User = Depends(current_user)):
-    """Delete my account: every row of this student, then their cached audio. The browser then signs out."""
-    session_ids = select(PracticeSession.id).where(PracticeSession.user_id == user.id)
-    question_ids = select(Question.id).where(Question.session_id.in_(session_ids))
-    db.execute(delete(Attempt).where((Attempt.user_id == user.id) | Attempt.question_id.in_(question_ids)))
-    db.execute(delete(Question).where(Question.session_id.in_(session_ids)))
-    db.execute(delete(PracticeSession).where(PracticeSession.user_id == user.id))
-    db.execute(delete(VoiceClone).where(VoiceClone.user_id == user.id))
-    db.execute(delete(UsageDaily).where(UsageDaily.user_id == user.id))
-    db.execute(delete(User).where(User.id == user.id))
-    db.commit()
-    tts_cache.delete_user(user.id)
-    log.info("account deleted: %s", user.id)
-    return Response(status_code=204)
-
-
-@app.post("/api/sessions", status_code=201)
-def create_session(jd_text: str = Form(...), round_type: str = Form("hr"), target_role: str = Form(""),
-                   resume_text: str = Form(""), resume_file: UploadFile | None = File(None),
-                   db: Session = Depends(get_session), user: User = Depends(current_user)):
+@app.post("/api/prepare")
+def prepare(request: Request, jd_text: str = Form(...), round_type: str = Form("hr"), target_role: str = Form(""),
+            resume_text: str = Form(""), resume_file: UploadFile | None = File(None)):
+    """Read a resume and job description; return the cleaned texts, the profile and 5 questions."""
     if round_type not in ROUNDS:
         raise HTTPException(422, "Unknown round type")
     if resume_file and resume_file.filename:
@@ -313,15 +132,12 @@ def create_session(jd_text: str = Form(...), round_type: str = Form("hr"), targe
         raise HTTPException(422, "Paste the job description (at least a few lines).")
     resume_text = pii.redact(resume_text)[:15000]
     jd_text = pii.redact(jd_text)[:10000]
-    limits.check_daily(db, user, "sessions")
-    limits.check_burst(user)
-    paused = limits.claude_paused(db)
-    db.commit()  # don't hold a database connection while Claude works
+    limits.check_heavy(_client(request))
 
     notes = []
     usage = claude.Usage()
     try:
-        if paused:
+        if limits.budget.claude_paused():
             raise claude.LLMError("this month's coaching budget is used up")
         prep = claude.prepare(resume_text, jd_text, round_type, target_role, usage=usage)
         source = "claude"
@@ -331,104 +147,70 @@ def create_session(jd_text: str = Form(...), round_type: str = Form("hr"), targe
         source = "stand-in"
         if settings.claude_enabled:
             notes.append(f"Claude was unavailable ({exc}), so these are template questions.")
+    used = usage.as_dict()
+    limits.budget.add(claude_usd=used["usd"] or 0)
+    log.info("session prepared, claude usage %s", json.dumps(used))
 
     profile = prep.model_dump(exclude={"questions"})
-    profile["source"] = source
-    profile["notes"] = notes
-    profile["usage"] = usage.as_dict()
-    log.info("session prepared, claude usage %s", json.dumps(profile["usage"]))
-    s = PracticeSession(user_id=user.id, round_type=round_type, resume_text=resume_text, jd_text=jd_text,
-                        target_role=(target_role or prep.target_role)[:120], profile=profile)
-    db.add(s)
-    db.flush()
-    for i, q in enumerate(prep.questions):
-        db.add(Question(session_id=s.id, position=i, text=q.text, why=q.why))
-    if prep.first_name and not user.name:
-        user.name = prep.first_name
-        db.merge(user)
-    limits.record(db, user, sessions=1, claude_usage=profile["usage"])
-    db.commit()
-    return get_session_detail(s.id, db, user)
+    profile.update(source=source, notes=notes, usage=used)
+    return {"round_type": round_type, "round_label": ROUNDS[round_type],
+            "target_role": (target_role or prep.target_role)[:120], "first_name": prep.first_name,
+            "resume_text": resume_text, "jd_text": jd_text, "profile": profile,
+            "questions": [{"text": q.text, "why": q.why, "sig": sign("question", "en-IN", q.text)}
+                          for q in prep.questions]}
 
 
-@app.get("/api/sessions")
-def list_sessions(db: Session = Depends(get_session), user: User = Depends(current_user)):
-    rows = db.scalars(select(PracticeSession).where(PracticeSession.user_id == user.id)
-                      .order_by(PracticeSession.created_at.desc())).all()
-    return [{"id": s.id, "round_type": s.round_type, "target_role": s.target_role,
-             "created_at": s.created_at.isoformat() + "Z"} for s in rows]
+class AnswerContext(BaseModel):
+    """What the browser sends with an answer: the question and the session it belongs to."""
+    question: str = Field(min_length=1, max_length=400)
+    why: str = Field("", max_length=400)
+    kind: Literal["main", "follow_up"] = "main"
+    round_type: str
+    target_role: str = Field("", max_length=200)
+    requirements: list[str] = Field(default_factory=list, max_length=20)
+    skills: list[str] = Field(default_factory=list, max_length=40)
+    resume_text: str = Field(min_length=1, max_length=16000)
+    feedback_language: str = "hi-IN"
 
 
-@app.get("/api/sessions/{session_id}")
-def get_session_detail(session_id: str, db: Session = Depends(get_session), user: User = Depends(current_user)):
-    s = _owned_session(db, user, session_id)
-    questions = []
-    for q in _questions(db, s.id):
-        attempts = db.scalars(select(Attempt).where(Attempt.question_id == q.id).order_by(Attempt.number)).all()
-        questions.append(_question_json(q, list(attempts)))
-    return {"id": s.id, "round_type": s.round_type, "round_label": ROUNDS[s.round_type],
-            "target_role": s.target_role, "profile": s.profile, "questions": questions, "jd_text": s.jd_text,
-            "created_at": s.created_at.isoformat() + "Z"}
+def _clean_key(value: str | None) -> str | None:
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", value):
+        raise HTTPException(422, "Idempotency-Key must be 8-64 letters, digits, - or _.")
+    return value
 
 
-@app.get("/api/questions/{question_id}")
-def get_question(question_id: str, db: Session = Depends(get_session), user: User = Depends(current_user)):
-    q, s = _owned_question(db, user, question_id)
-    attempts = db.scalars(select(Attempt).where(Attempt.question_id == q.id).order_by(Attempt.number)).all()
-    data = _question_json(q, list(attempts))
-    data.update(session_id=s.id, target_role=s.target_role, round_label=ROUNDS[s.round_type],
-                history=[_attempt_json(a) for a in attempts], **_place(db, q))
-    return data
-
-
-@app.get("/api/questions/{question_id}/audio")
-def question_audio(question_id: str, db: Session = Depends(get_session), user: User = Depends(current_user)):
-    """The interviewer reads the question aloud (Timbre, English)."""
-    q, _ = _owned_question(db, user, question_id)
-    return _speech(db, user, f"q/{q.id}", q.text,
-                   lambda: gnani.synthesize(q.text, gnani.ENGLISH_LANGUAGE, gnani.ENGLISH_VOICE, speed=0.95))
-
-
-@app.post("/api/questions/{question_id}/attempts", status_code=201)
-def create_attempt(question_id: str, audio_file: UploadFile | None = File(None), text: str = Form(""),
-                   idempotency_key: str | None = Header(None), db: Session = Depends(get_session),
-                   user: User = Depends(current_user)):
-    """One answer turn. The browser sends an Idempotency-Key, so a retried upload never scores (or bills) twice."""
-    q, s = _owned_question(db, user, question_id)
-    key = _clean_key(idempotency_key)
-    if key and (done := _attempt_by_key(db, user, key)):
-        return _attempt_reply(db, done, q)
-    limits.check_daily(db, user, "answers")
-    limits.check_burst(user)
-    if not limits.take_answer_slot(db, user):
-        raise HTTPException(429, "Finish your current answer first.")
+@app.post("/api/score")
+def score(request: Request, context: str = Form(...), audio_file: UploadFile | None = File(None),
+          text: str = Form(""), idempotency_key: str | None = Header(None)):
+    """One answer turn: transcribe (if spoken), measure, coach. A retried upload with the same Idempotency-Key
+    gets the first result instead of being scored (and paid for) twice."""
     try:
-        if key and (done := _attempt_by_key(db, user, key)):  # finished while we waited for the slot
-            return _attempt_reply(db, done, q)
-        return _score_answer(db, user, q, s, audio_file, text, key)
-    finally:
-        limits.free_answer_slot(db, user)
+        ctx = AnswerContext.model_validate_json(context)
+    except ValidationError:
+        raise HTTPException(422, "The question details sent with the answer are incomplete. Reload the page.")
+    if ctx.round_type not in ROUNDS or ctx.feedback_language not in LANGUAGES:
+        raise HTTPException(422, "Unknown round or feedback language.")
+    client = _client(request)
+    key = _clean_key(idempotency_key)
+    if key and (done := limits.replies.get(f"{client}:{key}")):
+        return done
+    limits.check_heavy(client)
+    reply = _score_answer(ctx, audio_file, text)
+    if key:
+        limits.replies.put(f"{client}:{key}", reply)
+    return reply
 
 
-def _attempt_by_key(db: Session, user: User, key: str) -> Attempt | None:
-    return db.scalar(select(Attempt).where(Attempt.user_id == user.id, Attempt.idempotency_key == key))
-
-
-def _attempt_reply(db: Session, a: Attempt, q: Question, timings: dict | None = None) -> dict:
-    previous = db.scalar(select(Attempt).where(Attempt.question_id == q.id, Attempt.number == a.number - 1))
-    follow = db.scalar(select(Question).where(Question.parent_id == q.id))
-    out = _attempt_json(a, previous)
-    out["follow_up_question_id"] = follow.id if follow else None
-    out["timings"] = timings or {}
-    return out
-
-
-def _score_answer(db: Session, user: User, q: Question, s: PracticeSession, audio_file: UploadFile | None,
-                  text: str, key: str | None) -> dict:
+def _score_answer(ctx: AnswerContext, audio_file: UploadFile | None, text: str) -> dict:
     started = time.monotonic()
     notes: list[str] = []
     acoustic: dict = {}
     timings: dict = {}
+    resume = pii.redact(ctx.resume_text)[:15000]
+    skills = [s[:40] for s in ctx.skills]
+    requirements = [r[:120] for r in ctx.requirements]
 
     if audio_file and audio_file.filename:
         data = audio_file.file.read(MAX_AUDIO_BYTES + 1)
@@ -448,16 +230,16 @@ def _score_answer(db: Session, user: User, q: Question, s: PracticeSession, audi
             raise HTTPException(422, "We couldn't hear any speech. Check your microphone and try again.")
         if not gnani.enabled():
             raise HTTPException(503, "Speech-to-text is off (VACHANA_API_KEY not set). Type your answer instead.")
-        if limits.speech_paused(db):
+        if limits.budget.speech_paused():
             raise HTTPException(503, "Speech-to-text is paused for this month. Type your answer instead.")
-        db.commit()  # don't hold a database connection while Prisma works
         t = time.monotonic()
         try:
-            transcript = gnani.transcribe_answer(samples, rate, bias=gnani.bias_words(s.profile.get("skills", [])))
+            transcript = gnani.transcribe_answer(samples, rate, bias=gnani.bias_words(skills))
         except gnani.GnaniError as exc:
             log.warning("transcription failed: %s", exc)
             raise HTTPException(502, "Speech-to-text failed. Please try again, or type your answer.")
         timings["stt_s"] = round(time.monotonic() - t, 2)
+        limits.budget.add(prisma_seconds=acoustic.get("duration_s") or seconds)
         if not transcript:
             raise HTTPException(422, "We couldn't make out any words. Try again a little closer to the mic.")
         spoken = True
@@ -476,24 +258,22 @@ def _score_answer(db: Session, user: User, q: Question, s: PracticeSession, audi
     speech_notes = delivery_notes + fluency_notes + [f"Said \"{h['said']}\": {h['why']}" for h in
                                                      lang["indian_english"]]
 
-    eval_args = dict(question=q.text, why=q.why, round_type=s.round_type, role=s.target_role,
-                     requirements=s.profile.get("jd_requirements", []), resume=s.resume_text, answer=transcript,
-                     speech_notes=speech_notes, feedback_language=user.feedback_language)
-    paused = limits.claude_paused(db)
-    db.commit()  # don't hold a database connection while Claude works
+    eval_args = dict(question=ctx.question, why=ctx.why, round_type=ctx.round_type, role=ctx.target_role,
+                     requirements=requirements, resume=resume, answer=transcript,
+                     speech_notes=speech_notes, feedback_language=ctx.feedback_language)
     t = time.monotonic()
     usage = claude.Usage()
-    rubric, unverified, source = None, [], "stand-in"
+    unverified, source = [], "stand-in"
     try:
-        if paused:
+        if limits.budget.claude_paused():
             raise claude.LLMError("this month's coaching budget is used up")
         ev = claude.evaluate(**eval_args, usage=usage)
         source = "claude"
-        missing = factcheck.unsupported(ev.rewrite, s.resume_text, transcript, q.text)
+        missing = factcheck.unsupported(ev.rewrite, resume, transcript, ctx.question)
         if missing:
             try:
-                ev.rewrite = claude.repair(ev.rewrite, missing, s.resume_text, transcript, usage=usage)
-                unverified = factcheck.unsupported(ev.rewrite, s.resume_text, transcript, q.text)
+                ev.rewrite = claude.repair(ev.rewrite, missing, resume, transcript, usage=usage)
+                unverified = factcheck.unsupported(ev.rewrite, resume, transcript, ctx.question)
             except claude.LLMError:
                 unverified = missing
     except claude.LLMError as exc:
@@ -505,87 +285,76 @@ def _score_answer(db: Session, user: User, q: Question, s: PracticeSession, audi
         else:
             notes.append("Sample coaching: add ANTHROPIC_API_KEY for real content feedback.")
     timings["llm_s"] = round(time.monotonic() - t, 2)
+    used = usage.as_dict()
+    limits.budget.add(claude_usd=used["usd"] or 0)
     rubric = {k: getattr(ev, k).model_dump() for k in ("answered", "structure", "specifics", "jd_fit")}
     if unverified:
         notes.append("Check the suggested answer: we couldn't find " + ", ".join(unverified[:5]) +
                      " in your resume or answer. Only say it if it's true.")
 
     parts = {"content": scoring.content(rubric), "fluency": fluency_score, "delivery": delivery_score}
-    scores = {**parts, "overall": scoring.overall(parts), "content_source": source}
-    used = usage.as_dict()
-
-    for retry in (False, True):  # attempt numbers are unique per question; recount once if two saves raced
-        try:
-            previous = db.scalars(select(Attempt).where(Attempt.question_id == q.id)
-                                  .order_by(Attempt.number.desc())).first()
-            a = Attempt(question_id=q.id, user_id=user.id, idempotency_key=key,
-                        number=(previous.number + 1) if previous else 1, transcript=transcript,
-                        duration_s=acoustic.get("duration_s"), acoustics=acoustic,
-                        language={**lang, "delivery_notes": delivery_notes, "fluency_notes": fluency_notes},
-                        scores=scores, content={**rubric, "strength": ev.strength, "follow_up": ev.follow_up,
-                                                "unverified": unverified, "usage": used},
-                        rewrite=ev.rewrite, tips=ev.tips[:3], native_feedback=ev.native_feedback,
-                        feedback_language=user.feedback_language, notes=notes)
-            db.add(a)
-            if ev.follow_up and q.kind == "main" and not db.scalar(select(Question).where(Question.parent_id == q.id)):
-                db.add(Question(session_id=s.id, position=q.position, text=ev.follow_up,
-                                why="Follow-up on what you just said.", kind="follow_up", parent_id=q.id))
-            limits.record(db, user, answers=1, claude_usage=used,
-                          prisma_seconds=(acoustic.get("duration_s") or 0) if spoken else 0)
-            db.commit()
-            break
-        except IntegrityError:
-            db.rollback()
-            if retry:
-                raise HTTPException(409, "This answer was saved twice at once. Refresh the page.")
-
+    follow_up = ev.follow_up if ctx.kind == "main" else ""
     timings["total_s"] = round(time.monotonic() - started, 2)
-    log.info("attempt %s user %s timings %s claude usage %s", a.id, user.id, json.dumps(timings), json.dumps(used))
-    return _attempt_reply(db, a, q, timings)
+    log.info("answer scored, timings %s claude usage %s", json.dumps(timings), json.dumps(used))
+    return {
+        "transcript": transcript, "duration_s": acoustic.get("duration_s"), "acoustics": acoustic,
+        "language": {**lang, "delivery_notes": delivery_notes, "fluency_notes": fluency_notes},
+        "scores": {**parts, "overall": scoring.overall(parts), "content_source": source},
+        "content": {**rubric, "strength": ev.strength, "follow_up": follow_up, "unverified": unverified,
+                    "usage": used},
+        "rewrite": ev.rewrite, "tips": ev.tips[:3], "native_feedback": ev.native_feedback,
+        "feedback_language": ctx.feedback_language, "notes": notes, "follow_up": follow_up,
+        "signatures": {"feedback": sign("feedback", ctx.feedback_language, ev.native_feedback),
+                       "answer": sign("answer", "en-IN", ev.rewrite),
+                       "follow_up": sign("question", "en-IN", follow_up) if follow_up else ""},
+        "timings": timings,
+    }
 
 
-@app.get("/api/attempts/{attempt_id}")
-def get_attempt(attempt_id: str, db: Session = Depends(get_session), user: User = Depends(current_user)):
-    a, q, s = _owned_attempt(db, user, attempt_id)
-    previous = db.scalar(select(Attempt).where(Attempt.question_id == q.id, Attempt.number == a.number - 1))
-    out = _attempt_json(a, previous)
-    out["question"] = {"id": q.id, "text": q.text, "why": q.why, "kind": q.kind, **_place(db, q)}
-    out["session_id"], out["round_label"] = s.id, ROUNDS[s.round_type]
-    follow = db.scalar(select(Question).where(Question.parent_id == q.id))
-    out["follow_up_question_id"] = follow.id if follow else None
-    return out
+class SpeakRequest(BaseModel):
+    kind: Literal["question", "feedback", "answer"]
+    text: str = Field(min_length=1, max_length=1600)
+    language: str = "en-IN"
+    sig: str = Field(max_length=64)
+    embedding: dict | None = None  # the student's cloned voice, for kind "answer"
 
 
-@app.get("/api/attempts/{attempt_id}/feedback-audio")
-def feedback_audio(attempt_id: str, db: Session = Depends(get_session), user: User = Depends(current_user)):
-    """Mother-tongue feedback spoken by a Timbre voice."""
-    a, _, _ = _owned_attempt(db, user, attempt_id)
-    voice = gnani.voice_for(a.feedback_language)
-    if a.feedback_language == "en-IN":
-        voice = gnani.ENGLISH_VOICE
-    if not voice:
-        raise HTTPException(404, f"No voice set up for {LANGUAGES.get(a.feedback_language)} yet; read it instead.")
-    return _speech(db, user, f"{a.id}/feedback", a.native_feedback,
-                   lambda: gnani.synthesize(a.native_feedback, a.feedback_language, voice))
-
-
-@app.get("/api/attempts/{attempt_id}/model-answer-audio")
-def model_answer_audio(attempt_id: str, db: Session = Depends(get_session), user: User = Depends(current_user)):
-    """The suggested answer, spoken in the student's own cloned voice if they set one up."""
-    a, _, _ = _owned_attempt(db, user, attempt_id)
-    text = a.rewrite.replace("[", "").replace("]", "")
-    clone = db.get(VoiceClone, user.id)
-    if clone:
-        voice_id = hashlib.sha256(clone.embedding.encode()).hexdigest()[:12]  # a new clone gets new audio
-        embedding = json.loads(clone.embedding)
-        return _speech(db, user, f"{a.id}/answer-{voice_id}", text, lambda: gnani.synthesize_clone(text, embedding))
-    return _speech(db, user, f"{a.id}/answer-default", text,
-                   lambda: gnani.synthesize(text, gnani.ENGLISH_LANGUAGE, gnani.ENGLISH_VOICE, speed=0.95))
+@app.post("/api/speak")
+def speak(body: SpeakRequest, request: Request):
+    """Read a Bol-written text aloud: a question (interviewer voice), feedback (the student's language) or the
+    better answer (the student's cloned voice when they send it, else the interviewer voice)."""
+    _check_signature(body.kind, body.language, body.text, body.sig)
+    if not gnani.enabled():
+        raise HTTPException(503, "Voices are off (VACHANA_API_KEY not set). Read the text instead.")
+    if limits.budget.voices_paused():
+        raise HTTPException(503, "Voices are paused for this month. Read the text instead.")
+    limits.check_heavy(_client(request))
+    text = body.text
+    try:
+        if body.kind == "question":
+            data = gnani.synthesize(text, gnani.ENGLISH_LANGUAGE, gnani.ENGLISH_VOICE, speed=0.95)
+        elif body.kind == "feedback":
+            voice = gnani.ENGLISH_VOICE if body.language == "en-IN" else gnani.voice_for(body.language)
+            if not voice:
+                raise HTTPException(404, f"No voice set up for {LANGUAGES.get(body.language)} yet; read it instead.")
+            data = gnani.synthesize(text, body.language, voice)
+        else:
+            text = text.replace("[", "").replace("]", "")
+            if body.embedding and body.embedding.get("embedding"):
+                if len(json.dumps(body.embedding)) > 500_000:
+                    raise HTTPException(413, "That voice data is too large. Set up your voice again.")
+                data = gnani.synthesize_clone(text, body.embedding)
+            else:
+                data = gnani.synthesize(text, gnani.ENGLISH_LANGUAGE, gnani.ENGLISH_VOICE, speed=0.95)
+    except gnani.GnaniError as exc:
+        raise HTTPException(503, str(exc))
+    limits.budget.add(timbre_chars=len(text))
+    return Response(content=data, media_type="audio/wav")
 
 
 @app.post("/api/voice-clone", status_code=201)
-def create_voice_clone(sample: UploadFile = File(...), consent: bool = Form(False),
-                       db: Session = Depends(get_session), user: User = Depends(current_user)):
+def create_voice_clone(request: Request, sample: UploadFile = File(...), consent: bool = Form(False)):
+    """Turn 5-30 s of the student's own voice into voice data. It goes back to the browser; Bol keeps no copy."""
     if not consent:
         raise HTTPException(422, "Please confirm this is your own voice and you agree to clone it.")
     data = sample.file.read(MAX_AUDIO_BYTES + 1)
@@ -598,45 +367,12 @@ def create_voice_clone(sample: UploadFile = File(...), consent: bool = Form(Fals
         raise HTTPException(422, f"The sample must be 5 to 30 seconds long (yours was {seconds:.0f} s).")
     if not audio.analyse(samples, rate).get("speech_s"):
         raise HTTPException(422, "We couldn't hear any speech in that sample.")
-    limits.check_daily(db, user, "voice_clones")
-    limits.check_burst(user)
-    db.commit()
+    limits.check_heavy(_client(request))
     try:
         embedding = gnani.clone_embedding(data)
     except gnani.GnaniError as exc:
         raise HTTPException(503, str(exc))
-    db.merge(VoiceClone(user_id=user.id, embedding=json.dumps(embedding)))
-    limits.record(db, user, voice_clones=1)
-    db.commit()
-    tts_cache.delete_user(user.id)  # old clips were in the old voice
-    return {"has_voice_clone": True}
-
-
-@app.delete("/api/voice-clone")
-def delete_voice_clone(db: Session = Depends(get_session), user: User = Depends(current_user)):
-    clone = db.get(VoiceClone, user.id)
-    if clone:
-        db.delete(clone)
-        db.commit()
-    tts_cache.delete_user(user.id)  # cached answers spoken in the cloned voice go too
-    return {"has_voice_clone": False}
-
-
-@app.get("/api/progress")
-def progress(db: Session = Depends(get_session), user: User = Depends(current_user)):
-    rows = db.execute(
-        select(Attempt, Question, PracticeSession)
-        .join(Question, Attempt.question_id == Question.id)
-        .join(PracticeSession, Question.session_id == PracticeSession.id)
-        .where(PracticeSession.user_id == user.id)
-        .order_by(Attempt.created_at)
-    ).all()
-    points = [{"attempt_id": a.id, "at": a.created_at.isoformat() + "Z", "question": q.text[:80],
-               "session_id": s.id, "role": s.target_role, **{k: a.scores.get(k) for k in
-                                                             ("overall", "content", "fluency", "delivery")},
-               "fillers_per_min": a.language.get("fillers_per_min"), "wpm": a.language.get("wpm"),
-               "english_share": a.language.get("english_share")} for a, q, s in rows]
-    return {"points": points, "count": len(points)}
+    return {"embedding": embedding}
 
 
 if settings.serve_web:  # local runs only; on Azure, Static Web Apps serves web/

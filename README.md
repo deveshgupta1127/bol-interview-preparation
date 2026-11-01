@@ -50,57 +50,35 @@ Cost: every feedback screen shows the Claude tokens and dollars for that answer.
 
 The tests never call paid APIs: keys are blanked and the network calls are replaced.
 
-## Privacy
+## Privacy: Bol stores nothing
 
-- Audio is processed in memory and never stored. Resumes are stored only after phone numbers, emails, links and ID
-  numbers are removed.
-- Voice cloning needs a consent tick and only your own voice; "Delete my voice" removes it.
+- No sign-in and no account. Your sessions, answers, scores and cloned voice live only in your browser's storage
+  (`web/store.js`). Settings → "Start fresh" deletes them; so does clearing the browser's site data.
+- The server keeps nothing: no database, no files. Each request carries what it needs (for example the resume
+  summary along with an answer); the server analyses it in memory and forgets it. Recordings are never saved.
+- Phone numbers, emails, links and ID numbers are removed from resumes before analysis.
+- Voice cloning needs a consent tick and only your own voice; the voice data goes back to your browser only.
 - For demos use synthetic resumes (see `samples/`), never real people's.
 
-## Running on Azure (Phase 2)
+## Running on Azure
 
-Locally nothing changes: no sign-in, SQLite, the API serves `web/`. On Azure the same code runs with
-environment variables set (all listed in `.env.example`):
+Locally nothing changes: the API serves `web/` too. On Azure (set up by `infra/provision.ps1`):
 
 | Part | Azure | In the code |
 | - | - | - |
-| `web/` | Static Web Apps (Free) | `web/config.js` gets the API URL and sign-in settings at deploy time |
-| `app/` | Container Apps, from the `Dockerfile` | `SERVE_WEB=false`; CORS allows only the site |
-| Database | PostgreSQL Flexible Server B1ms | `DATABASE_URL`; tables made and upgraded by Alembic at start-up |
-| Sign-in | Entra External ID (email code, Google) | MSAL.js in the browser; `app/auth.py` checks every token |
-| Cached speech | Blob Storage, `tts-cache`, 7-day lifecycle rule | `app/tts_cache.py`, managed identity |
-| Logs and timings | Application Insights | OpenTelemetry; no transcripts, resumes or tokens in logs |
+| `web/` | Static Web Apps (Free, East Asia; served from the global edge) | `web/config.js` gets the API URL at deploy time |
+| `app/` | Container Apps in UAE North, from the `Dockerfile`, 1 replica | `SERVE_WEB=false`; CORS allows only the site |
+| API keys | Container app secrets | read as environment variables |
+| Logs and timings | Application Insights | OpenTelemetry; no transcripts, resumes or voice data in logs |
 
-Many students at once:
+Many students at once, with nothing stored:
 
-- Every row belongs to the signed-in student; other students' sessions, answers and voice return 404.
-- One answer at a time per student (a second one gets 429). A retried upload with the same `Idempotency-Key`
-  returns the first result instead of being scored and paid for twice.
-- Daily limits per student (30 answers, 5 sessions, 40 audio plays, 3 voice set-ups) and a monthly Claude
-  budget for the whole app ($25). When the budget is used up, coaching switches to the sample coaching.
-- `DELETE /api/me` (Settings → Delete my account) removes everything of that student.
-
-Guardrails:
-
-- **Prompt injection.** Student text (resume, job description, answer) sits inside tags Claude is told to treat as
-  data. `app/safety.py` removes those tags from student text, so a typed `</answer>` can't end the section early.
-  Short fields outside the tags (role, question) are flattened to one line. Claude has no tools and sees only that
-  student's own data.
-- **Checking what Claude writes.** Every field a student reads or hears is checked for abuse (English, Hinglish,
-  Devanagari) and hijack phrases. A failed reply falls back to the sample coaching with a note. Links, emails and
-  phone numbers are removed, and lengths are capped (spoken feedback at 1,200 characters, which also caps Timbre
-  cost). The check is local: no cost, no delay. Other languages are checked for links and leaks, not for abuse.
-- **Rate limits.** Per student: at most 10 expensive calls a minute (new sessions, answers, voice set-ups and
-  new audio). Per address: 120 API calls a minute, counted before sign-in is checked; `/api/health` is never
-  limited. Bodies over 10 MB are refused before they're read, and typed answers are capped at 3,000 characters.
-  The per-minute counts live in each replica's memory (up to 3x the limit across 3 replicas); the daily limits
-  are exact. `TRUSTED_PROXY_HOPS=1` on Container Apps, so a faked `X-Forwarded-For` can't dodge them.
-- **Sign-out.** After 30 minutes without activity the browser signs the student out, at Microsoft too, and clears
-  the tab's stored data. Expired tokens are refused by the API; the browser renews them silently or signs in again.
-- **Browser security headers** in `web/staticwebapp.config.json`: a Content Security Policy that allows only
-  this site, the MSAL script, Google Fonts and Entra sign-in. Pages can't be framed, and the microphone is allowed
-  only for this site. The deploy step must replace `__API_ORIGIN__` with the API's address (for example
-  `https://bol-api.<region>.azurecontainerapps.io`). Local runs send the same headers.
+- The server is stateless; the browser sends the question and session details with each answer.
+- Texts Bol may read aloud carry an HMAC signature, so `/api/speak` can't be used as free text-to-speech.
+- Per-address limits per minute (120 requests, 20 expensive calls), a monthly Claude budget in memory, and the
+  hard caps at the providers (Claude workspace spend limit, Gnani credits).
+- Gnani allows one request at a time per key: Bol queues its Gnani calls and retries, and runs one replica.
+- A retried upload with the same `Idempotency-Key` gets the first result instead of being scored twice.
 
 Build and run the image locally:
 

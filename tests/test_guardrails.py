@@ -5,11 +5,9 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import SAMPLES
+from conftest import JD, RESUME, prepare, score
 from app import claude, config, limits, main, safety
 
-RESUME = (SAMPLES / "resume_ananya.txt").read_text(encoding="utf-8")
-JD = (SAMPLES / "jd_associate_engineer.txt").read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -21,10 +19,10 @@ def client():
 @pytest.fixture(autouse=True)
 def fresh_counters():
     limits.per_ip.reset()
-    limits.per_student.reset()
+    limits.heavy.reset()
     yield
     limits.per_ip.reset()
-    limits.per_student.reset()
+    limits.heavy.reset()
 
 
 def with_settings(monkeypatch, modules, limits_=None, **values):
@@ -33,12 +31,6 @@ def with_settings(monkeypatch, modules, limits_=None, **values):
         on = dataclasses.replace(on, limits=dataclasses.replace(config.settings.limits, **limits_))
     for module in modules:
         monkeypatch.setattr(module, "settings", on)
-
-
-def question_id(client):
-    r = client.post("/api/sessions", data={"resume_text": RESUME, "jd_text": JD, "round_type": "hr"})
-    assert r.status_code == 201, r.text
-    return r.json()["questions"][0]["id"]
 
 
 def evaluation(**overrides):
@@ -122,17 +114,15 @@ def test_unsafe_questions_fall_back_to_templates(client, monkeypatch):
     prep = claude.Preparation(first_name="A", target_role="SDE", skills=[], claims=[], jd_requirements=[],
                               matched=[], gaps=[], resume_tips=[], questions=[bad] * 5)
     monkeypatch.setattr(claude, "_call", lambda *a, **k: prep)
-    r = client.post("/api/sessions", data={"resume_text": RESUME, "jd_text": JD, "round_type": "hr"})
-    assert r.status_code == 201
-    assert all("Ignore" not in q["text"] for q in r.json()["questions"])
+    assert all("Ignore" not in q["text"] for q in prepare(client, "hr")["questions"])
 
 
 def test_unsafe_feedback_falls_back_to_the_stand_in(client, monkeypatch):
-    qid = question_id(client)
+    p = prepare(client, "hr")
     monkeypatch.setattr(claude, "_call", lambda *a, **k: evaluation(strength="You fucking nailed it"))
     with_settings(monkeypatch, [main], claude_enabled=True)
-    r = client.post(f"/api/questions/{qid}/attempts", data={"text": "I built the canteen app in Flask."})
-    assert r.status_code == 201
+    r = score(client, p, "I built the canteen app in Flask.")
+    assert r.status_code == 200
     body = r.json()
     assert body["scores"]["content_source"] == "stand-in"
     assert "fucking" not in str(body) and any("safety check" in n for n in body["notes"])
@@ -141,32 +131,31 @@ def test_unsafe_feedback_falls_back_to_the_stand_in(client, monkeypatch):
 # ---------- sizes ----------
 
 def test_typed_answer_is_capped(client):
-    qid = question_id(client)
-    r = client.post(f"/api/questions/{qid}/attempts", data={"text": "word " * 700})
+    r = score(client, prepare(client, "hr"), "word " * 700)
     assert r.status_code == 413 and "too long" in r.json()["detail"]
 
 
 def test_huge_body_is_refused_before_reading(client, monkeypatch):
     with_settings(monkeypatch, [main], max_request_mb=1)
-    r = client.post("/api/sessions", data={"resume_text": "x" * (2 * 1024 * 1024), "jd_text": JD})
+    r = client.post("/api/prepare", data={"resume_text": "x" * (2 * 1024 * 1024), "jd_text": JD})
     assert r.status_code == 413
 
 
 # ---------- burst limits ----------
 
-def test_per_student_burst_limit(client, monkeypatch):
-    qid = question_id(client)
+def test_burst_limit_on_expensive_calls(client, monkeypatch):
+    p = prepare(client, "hr")
     with_settings(monkeypatch, [limits], limits_={"heavy_per_minute": 2})
-    limits.per_student.reset()
-    ok = [client.post(f"/api/questions/{qid}/attempts", data={"text": "I built the app in Flask."}) for _ in range(2)]
-    assert [r.status_code for r in ok] == [201, 201]
-    r = client.post(f"/api/questions/{qid}/attempts", data={"text": "I built the app in Flask."})
+    limits.heavy.reset()
+    ok = [score(client, p, "I built the app in Flask.") for _ in range(2)]
+    assert [r.status_code for r in ok] == [200, 200]
+    r = score(client, p, "I built the app in Flask.")
     assert r.status_code == 429 and 0 < int(r.headers["Retry-After"]) <= 60
 
 
 def test_per_address_limit_spares_health(client, monkeypatch):
     with_settings(monkeypatch, [main], limits_={"requests_per_minute_per_ip": 3})
-    codes = [client.get("/api/me").status_code for _ in range(4)]
+    codes = [client.get("/api/config").status_code for _ in range(4)]
     assert codes == [200, 200, 200, 429]
     assert client.get("/api/health").status_code == 200  # Azure's probes are never throttled
 
@@ -182,10 +171,10 @@ def test_client_address_trusts_only_our_proxy(monkeypatch):
 # ---------- headers ----------
 
 def test_security_headers(client):
-    api = client.get("/api/me").headers
+    api = client.get("/api/config").headers
     assert api["cache-control"] == "no-store" and api["x-content-type-options"] == "nosniff"
     page = client.get("/").headers
     csp = page["content-security-policy"]
-    assert "frame-ancestors 'none'" in csp and "script-src 'self' https://cdn.jsdelivr.net;" in csp
+    assert "frame-ancestors 'none'" in csp and "script-src 'self';" in csp
     assert "__API_ORIGIN__" not in csp and "strict-transport-security" not in page
     assert page["permissions-policy"].startswith("microphone=(self)")
