@@ -53,7 +53,8 @@ The tests never call paid APIs: keys are blanked and the network calls are repla
 ## Privacy: Bol stores nothing
 
 - No sign-in and no account. Your sessions, answers, scores and cloned voice live only in your browser's storage
-  (`web/store.js`). Settings → "Start fresh" deletes them; so does clearing the browser's site data.
+  (`web/store.js`). Settings → "Download a backup" / "Restore a backup" moves them to another device;
+  "Start fresh" deletes them, and so does clearing the browser's site data.
 - The server keeps nothing: no database, no files. Each request carries what it needs (for example the resume
   summary along with an answer); the server analyses it in memory and forgets it. Recordings are never saved.
 - Phone numbers, emails, links and ID numbers are removed from resumes before analysis.
@@ -68,15 +69,19 @@ Locally nothing changes: the API serves `web/` too. On Azure (set up by `infra/p
 | - | - | - |
 | `web/` | Static Web Apps (Free, East Asia; served from the global edge) | `web/config.js` gets the API URL at deploy time |
 | `app/` | Container Apps in UAE North, from the `Dockerfile`, 1 replica | `SERVE_WEB=false`; CORS allows only the site |
+| Image | GitHub Container Registry (`ghcr.io`, free for a public repository) | built by GitHub Actions |
 | API keys | Container app secrets | read as environment variables |
+| Spend counters | Azure Table in a small storage account (numbers only; identity access, no keys) | `app/counters.py` |
 | Logs and timings | Application Insights | OpenTelemetry; no transcripts, resumes or voice data in logs |
 
 Many students at once, with nothing stored:
 
 - The server is stateless; the browser sends the question and session details with each answer.
 - Texts Bol may read aloud carry an HMAC signature, so `/api/speak` can't be used as free text-to-speech.
-- Per-address limits per minute (120 requests, 20 expensive calls), a monthly Claude budget in memory, and the
-  hard caps at the providers (Claude workspace spend limit, Gnani credits).
+- Limits per address: 120 requests and 20 expensive calls a minute (in memory), and per day 10 sessions,
+  60 answers, 120 audio plays and 5 voice set-ups (counters table, so they survive restarts). A monthly Claude
+  budget for the whole app, also in the table. Addresses are stored only as one-way hashes. Behind all of it,
+  the hard caps at the providers: the Claude workspace spend limit and the Gnani credits.
 - Gnani allows one request at a time per key: Bol queues its Gnani calls and retries, and runs one replica.
 - A retried upload with the same `Idempotency-Key` gets the first result instead of being scored twice.
 

@@ -754,10 +754,31 @@ async function settingsPage() {
       <div class="card"><span class="label">Your data</span>
         <p>Everything stays in this browser: your sessions, answers, scores and voice. Bol's server keeps nothing, and there is no account.</p>
         <p class="note">Resumes and answers are sent to the server only while they're being analysed, then forgotten. Recordings are never saved anywhere.</p>
+        <div class="row">
+          <button class="btn" id="backup">Download a backup</button>
+          <label class="btn" for="restore-file">Restore a backup</label>
+          <input type="file" id="restore-file" accept=".json,application/json" hidden>
+        </div>
+        <p class="note">Another browser or device starts empty: download a backup here and restore it there. The file holds your practice and voice data, so keep it private.</p>
         <div class="row"><button class="btn" id="delete-me">Start fresh: delete everything</button></div>
-        <p class="note">Clearing this browser's site data does the same. Another browser or device starts empty.</p>
+        <p class="note">Clearing this browser's site data does the same.</p>
       </div>
     </div>`;
+  $("#backup").onclick = () => {
+    const link = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(Store.backup()), download: `bol-backup-${localDay(new Date().toISOString())}.json` });
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  };
+  $("#restore-file").onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (!confirm("Replace the practice saved in this browser with this backup?")) { e.target.value = ""; return; }
+    try {
+      Store.restore(await file.text());
+      me = null; location.hash = "#/progress"; route();
+    } catch (err) { showError(err); e.target.value = ""; }
+  };
   $("#delete-me").onclick = async () => {
     if (!confirm("Delete everything Bol saved in this browser? Every session, answer, score and your cloned voice will be removed. This can't be undone.")) return;
     try {

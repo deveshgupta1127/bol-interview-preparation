@@ -1,18 +1,26 @@
-"""Spend guards, all in this server's memory (Bol stores nothing).
+"""Spend guards. Bol stores no student data; these keep only numbers.
 
-  - per address, per minute: every API call, and separately the expensive ones (Claude, Prisma, Timbre, cloning)
-  - for the whole app, per calendar month: Claude dollars, Prisma minutes, Timbre characters (0 = no limit)
+  - per address, per minute (in memory): every API call, and separately the expensive ones
+  - per address, per day (counters.py, survives restarts): sessions, answers, audio plays, voice set-ups
+  - for the whole app, per calendar month (counters.py): Claude dollars, Prisma minutes, Timbre characters
 
-Memory resets when the server restarts, so these are a first line of defence. The hard caps sit with the
-providers: the Claude workspace spend limit and the fixed Gnani credits.
+Addresses are hashed before they're counted. If the counter store can't be reached, requests go ahead (and the
+problem is logged): an outage of the counters shouldn't take Bol down. The hard caps sit with the providers:
+the Claude workspace spend limit and the fixed Gnani credits.
 """
+import hashlib
+import hmac
+import logging
 import threading
 import time
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
+from . import counters
 from .config import settings
+
+log = logging.getLogger("bol")
 
 
 class MinuteCounter:
@@ -62,49 +70,83 @@ def client_ip(headers, peer: str | None) -> str:
     return peer or "unknown"
 
 
+# ---------- daily limits per address ----------
+
+DAILY = {  # counter -> (limit setting, message)
+    "sessions": ("sessions_per_day", "You can start {n} practice sessions a day. Continue one you've started."),
+    "answers": ("answers_per_day", "Daily practice limit reached ({n} answers). See you tomorrow!"),
+    "speech": ("speech_per_day", "Daily listening limit reached ({n} plays). Read the text instead."),
+    "voice_clones": ("voice_clones_per_day", "You can set up your voice {n} times a day. Try again tomorrow."),
+}
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _month() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def address_key(client: str) -> str:
+    """A one-way hash of the address, so the counter store never holds an IP address."""
+    return hmac.new(settings.signing_key, client.encode(), hashlib.sha256).hexdigest()[:20]
+
+
+def check_daily(client: str, kind: str) -> None:
+    """Count one use of `kind` by this address today; refuse it once the day's limit is passed."""
+    setting, message = DAILY[kind]
+    limit = getattr(settings.limits, setting)
+    if not limit:
+        return
+    try:
+        used = counters.store.add(f"day-{_today()}", f"{address_key(client)}:{kind}", 1)
+    except Exception as exc:  # counters unreachable: let the request through, say so in the logs
+        log.warning("daily counter unavailable: %s", type(exc).__name__)
+        return
+    if used > limit:
+        raise HTTPException(429, message.format(n=limit))
+
+
 # ---------- monthly budget for the whole app ----------
 
 class Budget:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.month = ""
-        self.claude_usd = self.prisma_seconds = 0.0
-        self.timbre_chars = 0
+    """Claude dollars, Prisma minutes and Timbre characters spent this calendar month, across restarts."""
 
-    def _roll(self) -> None:
-        month = datetime.now(timezone.utc).strftime("%Y-%m")
-        if month != self.month:
-            self.month, self.claude_usd, self.prisma_seconds, self.timbre_chars = month, 0.0, 0.0, 0
+    LIMITS = {"claude_usd": "claude_usd_per_month", "prisma_seconds": "prisma_minutes_per_month",
+              "timbre_chars": "timbre_chars_per_month"}
 
     def add(self, *, claude_usd: float = 0, prisma_seconds: float = 0, timbre_chars: int = 0) -> None:
-        with self._lock:
-            self._roll()
-            self.claude_usd += claude_usd or 0
-            self.prisma_seconds += prisma_seconds or 0
-            self.timbre_chars += timbre_chars or 0
+        for name, amount in (("claude_usd", claude_usd), ("prisma_seconds", prisma_seconds),
+                             ("timbre_chars", timbre_chars)):
+            if amount:
+                try:
+                    counters.store.add(f"month-{_month()}", name, float(amount))
+                except Exception as exc:
+                    log.warning("budget counter unavailable: %s", type(exc).__name__)
 
-    def reset(self) -> None:
-        with self._lock:
-            self.month = ""
-            self._roll()
+    def _over(self, name: str, scale: float = 1) -> bool:
+        limit = getattr(settings.limits, self.LIMITS[name])
+        if not limit:
+            return False
+        try:
+            return counters.store.get(f"month-{_month()}", name) >= limit * scale
+        except Exception as exc:
+            log.warning("budget counter unavailable: %s", type(exc).__name__)
+            return False
 
     def claude_paused(self) -> bool:
-        with self._lock:
-            self._roll()
-            limit = settings.limits.claude_usd_per_month
-            return bool(limit and self.claude_usd >= limit)
+        return self._over("claude_usd")
 
     def speech_paused(self) -> bool:
-        with self._lock:
-            self._roll()
-            limit = settings.limits.prisma_minutes_per_month
-            return bool(limit and self.prisma_seconds >= limit * 60)
+        return self._over("prisma_seconds", 60)  # the limit is in minutes
 
     def voices_paused(self) -> bool:
-        with self._lock:
-            self._roll()
-            limit = settings.limits.timbre_chars_per_month
-            return bool(limit and self.timbre_chars >= limit)
+        return self._over("timbre_chars")
+
+    def reset(self) -> None:  # tests
+        if hasattr(counters.store, "reset"):
+            counters.store.reset()
 
 
 budget = Budget()

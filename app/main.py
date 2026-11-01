@@ -133,6 +133,7 @@ def prepare(request: Request, jd_text: str = Form(...), round_type: str = Form("
     resume_text = pii.redact(resume_text)[:15000]
     jd_text = pii.redact(jd_text)[:10000]
     limits.check_heavy(_client(request))
+    limits.check_daily(_client(request), "sessions")
 
     notes = []
     usage = claude.Usage()
@@ -197,6 +198,7 @@ def score(request: Request, context: str = Form(...), audio_file: UploadFile | N
     if key and (done := limits.replies.get(f"{client}:{key}")):
         return done
     limits.check_heavy(client)
+    limits.check_daily(client, "answers")
     reply = _score_answer(ctx, audio_file, text)
     if key:
         limits.replies.put(f"{client}:{key}", reply)
@@ -329,6 +331,7 @@ def speak(body: SpeakRequest, request: Request):
     if limits.budget.voices_paused():
         raise HTTPException(503, "Voices are paused for this month. Read the text instead.")
     limits.check_heavy(_client(request))
+    limits.check_daily(_client(request), "speech")
     text = body.text
     try:
         if body.kind == "question":
@@ -368,6 +371,7 @@ def create_voice_clone(request: Request, sample: UploadFile = File(...), consent
     if not audio.analyse(samples, rate).get("speech_s"):
         raise HTTPException(422, "We couldn't hear any speech in that sample.")
     limits.check_heavy(_client(request))
+    limits.check_daily(_client(request), "voice_clones")
     try:
         embedding = gnani.clone_embedding(data)
     except gnani.GnaniError as exc:

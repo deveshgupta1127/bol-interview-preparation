@@ -312,3 +312,4 @@ table.mini tbody tr:hover { background: color-mix(in srgb, var(--accent-soft) 35
 .steps li::before { content: counter(step); display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%;
   background: var(--accent-soft); color: var(--accent); font-family: var(--font-display); font-size: 0.75rem; }
 .steps b { color: var(--ink); }
+.side .plan > .sub-label { font-size: 0.72rem; color: var(--muted); }

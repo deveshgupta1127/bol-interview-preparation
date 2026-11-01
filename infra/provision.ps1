@@ -7,8 +7,9 @@ already exists is kept.
 Needs: the Azure CLI signed in (az login) to the Azure for Students subscription, and the .env file with
 ANTHROPIC_API_KEY and VACHANA_API_KEY.
 
-Bol stores nothing (the browser keeps each student's practice), so there is no database, no file storage and no
-sign-in to set up: just the API, its image registry, logs, and the static website.
+Bol stores no student data (the browser keeps each student's practice), so there is no database and no sign-in:
+the API, a small table of spend counters (numbers only), logs, and the static website. The API image lives in
+GitHub's free container registry (ghcr.io), so there is no Azure registry to pay for. Expected cost: under $1/month.
 
 Region: the subscription allows only eastasia, uaenorth, indiasouthcentral, indonesiacentral and koreacentral.
 Container Apps isn't offered in indiasouthcentral, so everything runs in UAE North, the closest allowed region to
@@ -54,11 +55,11 @@ Az config set extension.use_dynamic_install=yes_without_prompt core.only_show_er
 $sub = Az account show --query id -o tsv
 $sfx = $sub.Substring(0, 5)
 $names = @{
-  logs = "bol-logs"; insights = "bol-ai"; acr = "bolacr$sfx"; env = "bol-env"; app = "bol-api"; web = "bol-web"
+  logs = "bol-logs"; insights = "bol-ai"; store = "bolcount$sfx"; env = "bol-env"; app = "bol-api"; web = "bol-web"
 }
 Write-Host "Subscription: $(Az account show --query name -o tsv)   region: $Region   group: $Group"
 
-# ---------- env file (keys for Key Vault) ----------
+# ---------- env file (the two API keys) ----------
 $envFile = Join-Path $root ".env"
 $dotenv = @{}
 Get-Content $envFile | Where-Object { $_ -match '^\s*([A-Z_]+)\s*=\s*(.*)$' } | ForEach-Object {
@@ -79,11 +80,13 @@ if (-not (Exists monitor app-insights component show -g $Group --app $names.insi
 }
 $insightsConn = Az monitor app-insights component show -g $Group --app $names.insights --query connectionString -o tsv
 
-Step "Container Registry $($names.acr) (Standard)"
-if (-not (Exists acr show -g $Group -n $names.acr)) {
-  Az acr create -g $Group -n $names.acr -l $Region --sku Standard --admin-enabled false -o none
+Step "Storage $($names.store) for spend counters (Azure Table; numbers only, no keys: identity access)"
+if (-not (Exists storage account show -g $Group -n $names.store)) {
+  Az storage account create -g $Group -n $names.store -l $Region --sku Standard_LRS --kind StorageV2 `
+    --allow-blob-public-access false --allow-shared-key-access false --min-tls-version TLS1_2 -o none
 }
-$acrId = Az acr show -g $Group -n $names.acr --query id -o tsv
+$storeId = Az storage account show -g $Group -n $names.store --query id -o tsv
+$tableUrl = "https://$($names.store).table.core.windows.net"
 
 Step "Container Apps environment $($names.env)"
 if (-not (Exists containerapp env show -g $Group -n $names.env)) {
@@ -97,8 +100,8 @@ if (-not (Exists containerapp show -g $Group -n $names.app)) {
     --target-port 80 --ingress external --cpu 0.5 --memory 1.0Gi --min-replicas 0 --max-replicas 1 --system-assigned -o none
 }
 $appIdentity = Az containerapp show -g $Group -n $names.app --query identity.principalId -o tsv
-Role $appIdentity "ServicePrincipal" "AcrPull" $acrId
-Az containerapp registry set -g $Group -n $names.app --server "$($names.acr).azurecr.io" --identity system -o none
+# The app reads and writes its counters with its own identity; it creates the "counters" table on first use.
+Role $appIdentity "ServicePrincipal" "Storage Table Data Contributor" $storeId
 # The keys become container app secrets (encrypted at rest; visible only to people with access to the app).
 Az containerapp secret set -g $Group -n $names.app -o none --secrets `
   "anthropic-api-key=$($dotenv['ANTHROPIC_API_KEY'])" "vachana-api-key=$($dotenv['VACHANA_API_KEY'])" `
@@ -112,10 +115,16 @@ if (-not (Exists staticwebapp show -g $Group -n $names.web)) {
 }
 $webHost = Az staticwebapp show -g $Group -n $names.web --query defaultHostname -o tsv
 
+Step "Settings for the API (used from the first deploy on)"
+Az containerapp update -g $Group -n $names.app -o none --set-env-vars `
+  "ANTHROPIC_API_KEY=secretref:anthropic-api-key" "VACHANA_API_KEY=secretref:vachana-api-key" `
+  "APPLICATIONINSIGHTS_CONNECTION_STRING=secretref:insights-connection-string" `
+  "COUNTERS_TABLE_URL=$tableUrl" "CORS_ORIGINS=https://$webHost"
+
 # ---------- what later steps need (no secrets) ----------
 $outputs = [ordered]@{
   subscriptionId = $sub; resourceGroup = $Group; region = $Region
-  acrLoginServer = "$($names.acr).azurecr.io"; containerApp = $names.app; containerAppEnv = $names.env
+  containerApp = $names.app; containerAppEnv = $names.env; countersTable = $tableUrl
   apiUrl = "https://$apiHost"; webUrl = "https://$webHost"; staticWebApp = $names.web
 }
 $outputs | ConvertTo-Json | Set-Content -Path (Join-Path $PSScriptRoot "outputs.json") -Encoding utf8

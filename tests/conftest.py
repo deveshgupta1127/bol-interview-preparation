@@ -8,9 +8,10 @@ os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["ANTHROPIC_AUTH_TOKEN"] = ""
 os.environ["VACHANA_API_KEY"] = ""
 os.environ["SIGNING_SECRET"] = "test-signing-secret"
-for name in ("CORS_ORIGINS", "APPLICATIONINSIGHTS_CONNECTION_STRING"):
+for name in ("CORS_ORIGINS", "APPLICATIONINSIGHTS_CONNECTION_STRING", "COUNTERS_TABLE_URL"):
     os.environ[name] = ""
-for name in ("LIMIT_HEAVY_PER_MINUTE", "LIMIT_REQUESTS_PER_MINUTE_PER_IP"):  # no per-minute limits unless a test sets them
+for name in ("LIMIT_HEAVY_PER_MINUTE", "LIMIT_REQUESTS_PER_MINUTE_PER_IP", "LIMIT_SESSIONS_PER_DAY",
+             "LIMIT_ANSWERS_PER_DAY", "LIMIT_SPEECH_PER_DAY", "LIMIT_VOICE_CLONES_PER_DAY"):  # off unless a test sets them
     os.environ[name] = "100000"
 
 ROOT = Path(__file__).resolve().parent.parent

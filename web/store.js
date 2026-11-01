@@ -222,5 +222,23 @@ const Store = (() => {
     return server(path, opts);
   }
 
-  return { handle };
+  // ---------- backup and restore (to move practice to another device) ----------
+
+  function backup() {
+    return new Blob([JSON.stringify({ app: "bol", version: 1, saved_at: now(), data: db })], { type: "application/json" });
+  }
+
+  function restore(text) {
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
+    const data = parsed && parsed.app === "bol" && parsed.data;
+    if (!data || typeof data.sessions !== "object" || typeof data.attempts !== "object") {
+      throw new Error("That file isn't a Bol backup.");
+    }
+    db = { ...blank(), ...data, profile: { ...blank().profile, ...(data.profile || {}) } };
+    clips.clear();
+    save();
+  }
+
+  return { handle, backup, restore };
 })();

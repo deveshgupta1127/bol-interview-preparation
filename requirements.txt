@@ -1,5 +1,5 @@
 # What the API needs at run time (this is what the Docker image installs). Tests: requirements-dev.txt
-# No database or storage packages: Bol keeps nothing on the server.
+# No database: Bol keeps no student data. Azure Tables holds only spend counters (numbers).
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
@@ -10,3 +10,5 @@ anthropic>=0.70
 numpy>=1.26
 pypdf>=4.0
 azure-monitor-opentelemetry>=1.6
+azure-data-tables>=12.5
+azure-identity>=1.17

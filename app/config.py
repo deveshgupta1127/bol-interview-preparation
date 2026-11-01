@@ -41,10 +41,15 @@ def _signing_key() -> bytes:
 
 @dataclass(frozen=True)
 class Limits:
-    """Spend guards, in memory (Bol has no database). Per address per minute, and for the whole app per calendar
-    month (0 = no limit). The hard caps are the Claude workspace spend limit and the Gnani credits."""
+    """Spend guards (0 = no limit). Per address per minute (in memory) and per day, and for the whole app per
+    calendar month (counters.py). The hard caps are the Claude workspace spend limit and the Gnani credits.
+    A college lab can share one address, so the daily limits are generous."""
     requests_per_minute_per_ip: int = 120  # every /api call
     heavy_per_minute: int = 20  # per address: preparing a session, scoring an answer, speaking, voice cloning
+    sessions_per_day: int = 10
+    answers_per_day: int = 60
+    speech_per_day: int = 120
+    voice_clones_per_day: int = 5
     claude_usd_per_month: float = 25.0
     prisma_minutes_per_month: float = 0
     timbre_chars_per_month: int = 0
@@ -61,6 +66,8 @@ class Settings:
     serve_web: bool = True  # local runs serve web/ from the API; on Azure, Static Web Apps serves it
     cors_origins: tuple[str, ...] = ()
     limits: Limits = Limits()
+    counters_table_url: str = ""  # https://<account>.table.core.windows.net; empty = counters in memory
+    counters_table: str = "counters"
     max_answer_seconds: int = 180
     min_answer_seconds: int = 3
     max_typed_chars: int = 3000  # a 3-minute spoken answer is ~2,500 characters
@@ -83,11 +90,17 @@ def load_settings() -> Settings:
         limits=Limits(
             requests_per_minute_per_ip=_int("LIMIT_REQUESTS_PER_MINUTE_PER_IP", 120),
             heavy_per_minute=_int("LIMIT_HEAVY_PER_MINUTE", 20),
+            sessions_per_day=_int("LIMIT_SESSIONS_PER_DAY", 10),
+            answers_per_day=_int("LIMIT_ANSWERS_PER_DAY", 60),
+            speech_per_day=_int("LIMIT_SPEECH_PER_DAY", 120),
+            voice_clones_per_day=_int("LIMIT_VOICE_CLONES_PER_DAY", 5),
             claude_usd_per_month=_float("BUDGET_CLAUDE_USD_PER_MONTH", 25.0),
             prisma_minutes_per_month=_float("BUDGET_PRISMA_MINUTES_PER_MONTH", 0),
             timbre_chars_per_month=_int("BUDGET_TIMBRE_CHARS_PER_MONTH", 0),
         ),
         trusted_proxy_hops=_int("TRUSTED_PROXY_HOPS", 1 if os.getenv("CONTAINER_APP_NAME") else 0),
+        counters_table_url=os.getenv("COUNTERS_TABLE_URL", "").strip().rstrip("/"),
+        counters_table=os.getenv("COUNTERS_TABLE", "counters"),
     )
 
 
