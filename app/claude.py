@@ -9,6 +9,7 @@ Three jobs:
 With no ANTHROPIC_API_KEY, stand-in versions (stub_*) run so the app works offline for development.
 """
 import json
+import logging
 import re
 from functools import lru_cache
 from typing import Literal
@@ -18,6 +19,9 @@ from pydantic import BaseModel, ValidationError
 
 from . import language, rules, safety
 from .config import LANGUAGES, ROUNDS, settings
+
+
+log = logging.getLogger("bol.claude")
 
 
 class LLMError(RuntimeError):
@@ -271,6 +275,8 @@ def _call(prompt: str, schema: type[BaseModel], max_tokens: int, usage: Usage | 
     except anthropic.RateLimitError as exc:
         raise LLMError("Claude rate limit reached; try again in a minute") from exc
     except anthropic.APIStatusError as exc:
+        # The student sees only the status code; the log keeps Claude's message for diagnosis (no student text in it).
+        log.warning("Claude API error %s: %s", exc.status_code, exc.message)
         raise LLMError(f"Claude API error {exc.status_code}") from exc
     except anthropic.APIConnectionError as exc:
         raise LLMError("Couldn't reach Claude") from exc

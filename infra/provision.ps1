@@ -56,6 +56,7 @@ $sub = Az account show --query id -o tsv
 $sfx = $sub.Substring(0, 5)
 $names = @{
   logs = "bol-logs"; insights = "bol-ai"; store = "bolcount$sfx"; env = "bol-env"; app = "bol-api"; web = "bol-web"
+  identity = "bol-api-id"
 }
 Write-Host "Subscription: $(Az account show --query name -o tsv)   region: $Region   group: $Group"
 
@@ -93,15 +94,31 @@ if (-not (Exists containerapp env show -g $Group -n $names.env)) {
   Az containerapp env create -g $Group -n $names.env -l $Region --logs-workspace-id $wsCustomer --logs-workspace-key $wsKey -o none
 }
 
+Step "Identity $($names.identity) for the API (reads and writes the counters; no storage keys)"
+# Azure may create the environment in "Express" mode, which allows only user-assigned identities, so the API uses one.
+if (-not (Exists identity show -g $Group -n $names.identity)) {
+  Az identity create -g $Group -n $names.identity -l $Region -o none
+}
+$identityId = Az identity show -g $Group -n $names.identity --query id -o tsv
+$identityClient = Az identity show -g $Group -n $names.identity --query clientId -o tsv
+$identityPrincipal = Az identity show -g $Group -n $names.identity --query principalId -o tsv
+# The app creates the "counters" table on first use.
+Role $identityPrincipal "ServicePrincipal" "Storage Table Data Contributor" $storeId
+
 Step "Container app $($names.app) (0.5 vCPU, 1 GiB, 0-1 replicas; a placeholder image until the first deploy)"
+$identityType = & $az containerapp show -g $Group -n $names.app --query identity.type -o tsv 2>$null
+if ($identityType -match "SystemAssigned") {
+  # Left over from an earlier run with a built-in identity, which Express environments reject on every update.
+  # It only ever ran the placeholder image, so it's safe to recreate.
+  Write-Host "Recreating $($names.app) with the user-assigned identity"
+  Az containerapp delete -g $Group -n $names.app --yes -o none
+}
 if (-not (Exists containerapp show -g $Group -n $names.app)) {
   # Max 1 replica: Gnani allows one request at a time per key, so one replica keeps the queue in one place.
   Az containerapp create -g $Group -n $names.app --environment $names.env --image mcr.microsoft.com/k8se/quickstart:latest `
-    --target-port 80 --ingress external --cpu 0.5 --memory 1.0Gi --min-replicas 0 --max-replicas 1 --system-assigned -o none
+    --target-port 80 --ingress external --cpu 0.5 --memory 1.0Gi --min-replicas 0 --max-replicas 1 `
+    --user-assigned $identityId -o none
 }
-$appIdentity = Az containerapp show -g $Group -n $names.app --query identity.principalId -o tsv
-# The app reads and writes its counters with its own identity; it creates the "counters" table on first use.
-Role $appIdentity "ServicePrincipal" "Storage Table Data Contributor" $storeId
 # The keys become container app secrets (encrypted at rest; visible only to people with access to the app).
 Az containerapp secret set -g $Group -n $names.app -o none --secrets `
   "anthropic-api-key=$($dotenv['ANTHROPIC_API_KEY'])" "vachana-api-key=$($dotenv['VACHANA_API_KEY'])" `
@@ -119,7 +136,8 @@ Step "Settings for the API (used from the first deploy on)"
 Az containerapp update -g $Group -n $names.app -o none --set-env-vars `
   "ANTHROPIC_API_KEY=secretref:anthropic-api-key" "VACHANA_API_KEY=secretref:vachana-api-key" `
   "APPLICATIONINSIGHTS_CONNECTION_STRING=secretref:insights-connection-string" `
-  "COUNTERS_TABLE_URL=$tableUrl" "CORS_ORIGINS=https://$webHost"
+  "COUNTERS_TABLE_URL=$tableUrl" "CORS_ORIGINS=https://$webHost" `
+  "AZURE_CLIENT_ID=$identityClient" # tells DefaultAzureCredential which identity to use
 
 # ---------- what later steps need (no secrets) ----------
 $outputs = [ordered]@{
