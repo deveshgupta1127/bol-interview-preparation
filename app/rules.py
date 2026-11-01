@@ -123,6 +123,40 @@ OPENERS = {
 }
 
 
+# ---------- the script the feedback is written in ----------
+# Each feedback language and its writing system: name, and the first and last code point of its Unicode block.
+SCRIPTS = {
+    "hi-IN": ("Devanagari", 0x0900, 0x097F), "mr-IN": ("Devanagari", 0x0900, 0x097F),
+    "bn-IN": ("Bengali", 0x0980, 0x09FF), "pa-IN": ("Gurmukhi", 0x0A00, 0x0A7F),
+    "gu-IN": ("Gujarati", 0x0A80, 0x0AFF), "ta-IN": ("Tamil", 0x0B80, 0x0BFF),
+    "te-IN": ("Telugu", 0x0C00, 0x0C7F), "kn-IN": ("Kannada", 0x0C80, 0x0CFF),
+    "ml-IN": ("Malayalam", 0x0D00, 0x0D7F),
+}
+
+
+def script_name(lang: str) -> str:
+    return SCRIPTS[lang][0] if lang in SCRIPTS else "Latin"
+
+
+def script_share(text: str, lang: str) -> float | None:
+    """Share of the letters written in the language's own script (English words count against it).
+    None for English, which has nothing to check."""
+    if lang not in SCRIPTS:
+        return None
+    _, first, last = SCRIPTS[lang]
+    native = sum(1 for ch in text if first <= ord(ch) <= last)
+    latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+    return native / (native + latin) if native + latin else 0.0
+
+
+def in_own_script(text: str, lang: str, minimum: float = 0.25) -> bool:
+    """True when the text is written in the language's script. English technical words are expected and can be
+    over half the letters (a 31 Oct Tamil reply was 34% Tamil script and correct); romanised Hindi ("Acha,
+    aapne...") is close to 0%."""
+    share = script_share(text, lang)
+    return share is None or share >= minimum
+
+
 # ---------- the "specifics" score of an answer ----------
 _OWN_ROLE = re.compile(
     r"\b(I|we)\s+(?:\w+\s+)?(built|led|lead|designed|developed|created|implemented|wrote|coded|made|deployed|managed|"

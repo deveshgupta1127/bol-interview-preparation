@@ -122,3 +122,65 @@ def test_stand_in_uses_the_same_rules():
     assert (ev.specifics.score, ev.specifics.reason) == rules.specifics(answer)
     prep = claude.stub_prepare("Ananya\nBuilt a canteen ordering app in Flask for 300 students\n", "Python, SQL", "hr")
     assert prep.questions[0].text == rules.OPENERS["hr"][0]
+
+
+# ---------- feedback written in the language's own script ----------
+
+ROMANISED = ("Acha, GitHub mention karna sahi tha, lekin aapne kya banaya, kya problem solve kiya, aur kya result "
+             "mila, yeh sab bolna zaroori tha. Ek project pick karke STAR format mein bataiye.")
+DEVANAGARI = ("अच्छा, GitHub का ज़िक्र करना सही था, लेकिन आपने क्या बनाया और क्या result मिला, यह बताना ज़रूरी था। "
+              "एक project चुनकर STAR format में बताइए।")
+
+
+@pytest.mark.parametrize("text, lang, ok", [
+    (DEVANAGARI, "hi-IN", True),     # a few English words like GitHub and STAR are fine
+    (ROMANISED, "hi-IN", False),     # Hindi in English letters is not
+    ("நல்ல பதில். அடுத்த முறை STAR முறையில் சொல்லுங்கள்.", "ta-IN", True),
+    (DEVANAGARI, "ta-IN", False),    # right language family, wrong script
+    ("Good answer, add one number next time.", "en-IN", True),  # English has nothing to check
+])
+def test_feedback_script(text, lang, ok):
+    assert rules.in_own_script(text, lang) is ok
+
+
+class Replies:
+    """A fake Claude that answers each call with the next prepared reply."""
+
+    def __init__(self, *results):
+        self.results, self.sent = list(results), []
+
+    def parse(self, **kw):
+        self.sent.append(kw)
+        return SimpleNamespace(parsed_output=self.results.pop(0), stop_reason="end_turn")
+
+
+def _evaluate_with(monkeypatch, *results, lang="hi-IN"):
+    monkeypatch.setattr(claude, "settings", dataclasses.replace(config.settings, claude_enabled=True))
+    messages = Replies(*results)
+    monkeypatch.setattr(claude, "_client", lambda: SimpleNamespace(messages=messages))
+    ev = claude.evaluate(question="Q", why="w", round_type="hr", role="", requirements=[], resume="r",
+                         answer="I built a Flask app for 300 students.", speech_notes=[], feedback_language=lang)
+    return ev, messages.sent
+
+
+def _reply(native):
+    c = claude.Criterion(score=2, reason="ok")
+    return claude.EvalReply(answered=c, structure=c, jd_fit=c, strength="s", tips=[], rewrite="r", follow_up="",
+                            native_feedback=native)
+
+
+def test_romanised_feedback_is_rewritten_in_script(monkeypatch):
+    ev, sent = _evaluate_with(monkeypatch, _reply(ROMANISED), claude.ScriptFix(native_feedback=DEVANAGARI))
+    assert ev.native_feedback == DEVANAGARI and len(sent) == 2
+    assert "Devanagari" in sent[0]["messages"][0]["content"]  # the main prompt names the script
+    assert sent[1]["output_format"] is claude.ScriptFix
+
+
+def test_feedback_already_in_script_costs_no_extra_call(monkeypatch):
+    ev, sent = _evaluate_with(monkeypatch, _reply(DEVANAGARI))
+    assert ev.native_feedback == DEVANAGARI and len(sent) == 1
+
+
+def test_failed_fix_keeps_the_original(monkeypatch):
+    ev, sent = _evaluate_with(monkeypatch, _reply(ROMANISED), claude.ScriptFix(native_feedback=ROMANISED))
+    assert ev.native_feedback == ROMANISED and len(sent) == 2  # still readable aloud; no loop

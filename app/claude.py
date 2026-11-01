@@ -115,6 +115,10 @@ class Evaluation(BaseModel):
     native_feedback: str
 
 
+class ScriptFix(BaseModel):
+    native_feedback: str
+
+
 class RewriteFix(BaseModel):
     rewrite: str
 
@@ -190,10 +194,18 @@ with clear structure. Use only facts that appear in the resume or the answer. Ne
 companies, results or responsibilities that are not there; where a detail is missing write a placeholder in \
 square brackets such as [number of users] for them to fill in.
 - follow_up: one natural follow-up question an interviewer would ask about something they said, or "" if none.
-- native_feedback: feedback in {language}, written in {language}'s own script, 50-90 words, to be read aloud by \
+- native_feedback: feedback in {language}, {script_rule}, 50-90 words, to be read aloud by \
 a text-to-speech voice. Warm and direct, like a mentor: one strength, the two most useful improvements (combine \
 content and the speaking measurements above), and one encouraging line. Keep English technical words and short \
 English phrases they should use (like "I led" or STAR) in English. No markdown, lists or emojis."""
+
+SCRIPT_FIX = """This feedback for a student should be written in {language} using the {script} script, but much of it \
+is in Latin (English) letters. Rewrite it in {language} in the {script} script. Keep the meaning, the warm tone and \
+the length (50-90 words). Keep English technical words and short English phrases the student should use (like \
+"I led" or STAR) in English letters; write everything else in {script}. No markdown, lists or emojis.
+
+Feedback to rewrite:
+{feedback}"""
 
 REPAIR = """This suggested interview answer mentions details that are not in the student's resume or their answer: \
 {missing}. Rewrite it without those details. Where a missing detail matters, use a placeholder in square brackets \
@@ -323,12 +335,35 @@ def evaluate(*, question: str, why: str, round_type: str, role: str, requirement
                              requirements="; ".join(safety.one_line(r, 120) for r in requirements) or "not given",
                              resume=safety.strip_tags(resume)[:12000], answer=safety.strip_tags(answer)[:6000],
                              speech_note=note, language=LANGUAGES.get(feedback_language, "Hindi"),
+                             script_rule=_script_rule(feedback_language),
                              specifics=spec_score, specifics_reason=spec_reason)
     reply = _call(prompt, EvalReply, 3000, usage)
+    native = reply.native_feedback
+    if not rules.in_own_script(native, feedback_language):
+        native = _fix_script(native, feedback_language, usage)
     return _safe_evaluation(Evaluation(
         answered=reply.answered, structure=reply.structure, jd_fit=reply.jd_fit,
         specifics=Criterion(score=spec_score, reason=spec_reason), strength=reply.strength, tips=reply.tips,
-        rewrite=reply.rewrite, follow_up=reply.follow_up, native_feedback=reply.native_feedback))
+        rewrite=reply.rewrite, follow_up=reply.follow_up, native_feedback=native))
+
+
+def _script_rule(lang: str) -> str:
+    if lang not in rules.SCRIPTS:
+        return "written in English"
+    script = rules.script_name(lang)
+    return f"written in the {script} script, not in Latin (English) letters (no romanised {LANGUAGES[lang]})"
+
+
+def _fix_script(feedback: str, lang: str, usage: Usage | None) -> str:
+    """One short call to rewrite feedback that came back in English letters. If that fails, keep the original:
+    it still reads aloud correctly, it just isn't in the student's script."""
+    prompt = SCRIPT_FIX.format(language=LANGUAGES[lang], script=rules.script_name(lang),
+                               feedback=safety.strip_tags(feedback))
+    try:
+        fixed = _call(prompt, ScriptFix, 1200, usage).native_feedback
+    except LLMError:
+        return feedback
+    return fixed if rules.in_own_script(fixed, lang) else feedback
 
 
 def repair(rewrite: str, missing: list[str], resume: str, answer: str, usage: Usage | None = None) -> str:
