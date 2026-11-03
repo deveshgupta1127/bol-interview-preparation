@@ -6,7 +6,7 @@
 
 const Store = (() => {
   const KEY = "bol.v1";
-  const blank = () => ({ profile: { name: "", feedback_language: "hi-IN", interview_date: null, speak_feedback: true }, voice: null,
+  const blank = () => ({ profile: { name: "", feedback_language: "hi-IN", interview_date: null, autoplay_feedback: false }, voice: null,
     sessions: {}, questions: {}, attempts: {} });
   let db = load();
   let config = null;
@@ -134,7 +134,7 @@ const Store = (() => {
   async function updateMe(patch) {
     if (!config) config = await server("/api/config");
     if (patch.name != null) db.profile.name = String(patch.name).trim().slice(0, 80);
-    if (patch.speak_feedback != null) db.profile.speak_feedback = !!patch.speak_feedback;
+    if (patch.autoplay_feedback != null) db.profile.autoplay_feedback = !!patch.autoplay_feedback;
     if (patch.feedback_language != null) {
       if (!config.languages[patch.feedback_language]) throw new Error("Unsupported language");
       db.profile.feedback_language = patch.feedback_language;
@@ -247,7 +247,9 @@ const Store = (() => {
   }
 
   function progress() {
-    const points = Object.values(db.attempts).sort((a, b) => a.created_at.localeCompare(b.created_at)).map((a) => {
+    const linked = (a) => a.scores && db.questions[a.question_id] && db.sessions[db.questions[a.question_id].session_id];
+    const points = Object.values(db.attempts).filter(linked) // one damaged record mustn't blank the whole page
+      .sort((a, b) => a.created_at.localeCompare(b.created_at)).map((a) => {
       const q = db.questions[a.question_id], s = db.sessions[q.session_id];
       return { attempt_id: a.id, at: a.created_at, question: q.text.slice(0, 80), session_id: s.id, role: s.target_role,
         overall: a.scores.overall, content: a.scores.content, fluency: a.scores.fluency, delivery: a.scores.delivery,

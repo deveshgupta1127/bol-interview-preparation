@@ -504,8 +504,9 @@ async function interviewPage(id) {
     start.disabled = end.disabled = true;
     setStatus("Scoring…", "busy");
     $("#transcript").innerHTML = `<p class="note"><span class="spinner"></span> ${spoken ? "Prisma is transcribing, then your answer is scored…" : "Scoring your answer…"}</p>`;
-    // The feedback is read aloud while Claude writes it, when this language has a voice and the student wants it.
-    const voice = me.speech && !me.voices_paused && me.speak_feedback !== false && hasVoice(me.feedback_language)
+    // Only if the student switched it on in Settings: the feedback is read aloud while Claude writes it. Otherwise
+    // nothing plays until they press Listen (which streams, so it starts in about a second).
+    const voice = me.speech && !me.voices_paused && me.autoplay_feedback === true && hasVoice(me.feedback_language)
       ? liveVoice() : null;
     const live = {
       voice,
@@ -730,8 +731,16 @@ async function progressPage() {
   };
 
   if (!scored.length) {
+    // Sessions without answers are common (questions generated, none answered yet): point to them, not a blank page.
+    const sessions = await api("/api/sessions");
+    const saved = sessions.length
+      ? `<p>You have ${sessions.length} saved session${sessions.length > 1 ? "s" : ""} but no answers yet. Scores appear here once you answer a question.</p>
+         <ul class="list">${sessions.slice(0, 5).map((s) => `<li class="good"><span><a href="#/s/${s.id}">${esc(s.target_role || "Practice session")}</a>
+           <span class="note">· ${new Date(s.created_at).toLocaleDateString()}</span></span></li>`).join("")}</ul>`
+      : `<p>Answer a few questions and your scores will show up here, day by day.</p>`;
     view.innerHTML = `<div class="row between"><h1>Your progress</h1></div>
-      <div class="card"><p>Answer a few questions and your scores will show up here, day by day.</p><a class="btn primary" href="#/" style="justify-self:start">Start practising</a></div>
+      <div class="card">${saved}<a class="btn primary" href="#/" style="justify-self:start">Start practising</a>
+        <p class="note">Practice is saved in this browser, for this web address only. If you practised on another device, browser or address, use Settings → Download a backup there and restore it here.</p></div>
       <div class="grid2">${interviewCard()}</div>`;
     bindDate();
     return;
@@ -860,8 +869,8 @@ async function settingsPage() {
         <div class="field"><label for="name">Your name</label><input id="name" value="${esc(me.name)}" placeholder="First name"></div>
         <div class="field"><label for="lang">Feedback language</label><select id="lang">${langOptions(me.feedback_language)}</select></div>
         <div class="field"><label for="idate">Interview date</label><input type="date" id="idate" value="${me.interview_date || ""}"></div>
-        <label class="check"><input type="checkbox" id="autospeak" ${me.speak_feedback !== false ? "checked" : ""}>
-          <span>Speak my feedback as soon as I finish answering (it starts while the rest is still being scored)</span></label>
+        <label class="check"><input type="checkbox" id="autospeak" ${me.autoplay_feedback === true ? "checked" : ""}>
+          <span>Read my feedback aloud automatically as soon as I finish answering (otherwise press Listen)</span></label>
         <span class="note" id="saved">&nbsp;</span>
       </div>
       <div class="card"><span class="label">Services</span><dl class="kv">
@@ -909,7 +918,7 @@ async function settingsPage() {
   $("#name").onchange = (e) => saveMe({ name: e.target.value }).then(saved).catch(showError);
   $("#lang").onchange = (e) => saveMe({ feedback_language: e.target.value }).then(saved).catch(showError);
   $("#idate").onchange = (e) => saveMe({ interview_date: e.target.value }).then(saved).catch(showError);
-  $("#autospeak").onchange = (e) => saveMe({ speak_feedback: e.target.checked }).then(saved).catch(showError);
+  $("#autospeak").onchange = (e) => saveMe({ autoplay_feedback: e.target.checked }).then(saved).catch(showError);
 }
 
 // ---------- motion: page enter, bars filling, numbers counting up ----------

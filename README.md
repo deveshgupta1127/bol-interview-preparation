@@ -12,7 +12,7 @@ spoken answer, and coaches you, with the explanation in your own language.
 | Questions from resume + JD, rubric score, rewrite, tips, follow-up, mother-tongue feedback | **Claude Haiku 5.5**, called only from the backend (`app/claude.py`) |
 | Rewrite fact check (no invented numbers, tools or companies) | `app/factcheck.py`, with one repair call to Claude |
 | Question read aloud, feedback spoken in Hindi/Tamil/Kannada | Gnani **Timbre** text-to-speech, streamed |
-| Feedback spoken while it's still being written | `app/live.py`: Claude streams the feedback first; each sentence goes to Timbre's streaming voice at once, so the coach starts talking about 3 s after you finish (the full score lands at about 7 s) |
+| Feedback spoken while it's still being written (opt-in: Settings → "Read my feedback aloud automatically") | `app/live.py`: Claude streams the feedback first; each sentence goes to Timbre's streaming voice at once, so the coach starts talking about 3 s after you finish (the full score lands at about 7 s). Off by default: Listen streams on request |
 | Suggested answer spoken in your own voice | Gnani voice cloning (your own consented sample) |
 
 Score = 0.5 content + 0.25 fluency + 0.25 delivery (typed answers: content and fluency only).
