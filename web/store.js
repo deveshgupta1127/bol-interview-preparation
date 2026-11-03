@@ -152,7 +152,8 @@ const Store = (() => {
   function sessionDetail(id) {
     const s = db.sessions[id] || missing("That practice session");
     return { id: s.id, round_type: s.round_type, round_label: s.round_label, target_role: s.target_role,
-      profile: s.profile, questions: questionsOf(id).map(questionJson), jd_text: s.jd_text, created_at: s.created_at };
+      profile: s.profile, questions: questionsOf(id).map(questionJson), jd_text: s.jd_text, resume_text: s.resume_text,
+      created_at: s.created_at };
   }
 
   async function createSession(form) {

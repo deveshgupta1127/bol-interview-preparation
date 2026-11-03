@@ -420,11 +420,15 @@ async function sessionPage(id) {
   const mains = s.questions.filter((q) => q.kind === "main");
   const next = s.questions.find((q) => !q.attempts) || s.questions[0];
   const done = s.questions.filter((q) => q.attempts).length;
+  const templated = p.source !== "claude"; // made while Claude was unavailable (its note is from that day)
   view.innerHTML = `
     <div class="row between"><div><h1>${esc(s.target_role || "Practice session")}</h1>
       <p class="note">${esc(s.round_label)} · ${done} of ${s.questions.length} answered · created ${new Date(s.created_at).toLocaleDateString()}</p></div>
       <a class="btn" href="#/">+ New session</a></div>
-    ${(p.notes || []).map((n) => `<div class="alert">${esc(n)}</div>`).join("")}
+    ${templated && me.claude && !me.claude_paused ? `<div class="alert row between">
+        <span>These are template questions: Claude was unavailable when this session was made on ${new Date(s.created_at).toLocaleDateString()}. It's working now.</span>
+        <button class="btn small primary" id="redo">Make Claude questions for this resume and job</button></div>`
+      : (p.notes || []).map((n) => `<div class="alert">${esc(n)}</div>`).join("")}
     <div class="grid2">
       <div class="card">
         <div class="field"><span>Resume</span>
@@ -446,6 +450,17 @@ async function sessionPage(id) {
         <span class="row" style="gap:8px;flex-wrap:nowrap">${q.attempts ? `<span class="pill ${q.best >= 70 ? "ok" : q.best >= 45 ? "warn" : "miss"}">${q.best}</span>` : ""}
           <a class="btn small" href="#/q/${q.id}">${q.attempts ? "Retry" : "Answer"}</a></span></li>`).join("")}</ul></div>`;
   $("#lang").onchange = (e) => saveMe({ feedback_language: e.target.value }).catch(showError);
+  const redo = $("#redo");
+  if (redo) redo.onclick = async () => { // a new session from the same resume and job; this one (and its answers) stays
+    redo.disabled = true; redo.innerHTML = '<span class="spinner"></span> Claude is reading your resume…';
+    const form = new FormData();
+    for (const [k, v] of Object.entries({ resume_text: s.resume_text, jd_text: s.jd_text, round_type: s.round_type,
+      target_role: s.target_role || "" })) form.append(k, v);
+    try {
+      const fresh = await api("/api/sessions", { method: "POST", body: form });
+      location.hash = `#/s/${fresh.id}`;
+    } catch (err) { showError(err); redo.disabled = false; redo.textContent = "Try again"; }
+  };
 }
 
 // ---------- 2 Interview ----------
