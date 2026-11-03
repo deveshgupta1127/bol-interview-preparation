@@ -9,9 +9,10 @@ spoken answer, and coaches you, with the explanation in your own language.
 | "umm"/"uh" (Prisma drops them) | counted from the audio: steady-pitch sounds of 0.3-2 s (`app/audio.py`) |
 | Pace, pauses, loudness, trailing off, pitch variation | numpy on the server (`app/audio.py`) |
 | Fillers, Hindi/English mix, Indian-English phrasing | rules (`app/language.py`) |
-| Questions from resume + JD, rubric score, rewrite, tips, follow-up, mother-tongue feedback | **Claude Haiku 4.5**, called only from the backend (`app/claude.py`) |
+| Questions from resume + JD, rubric score, rewrite, tips, follow-up, mother-tongue feedback | **Claude Haiku 5.5**, called only from the backend (`app/claude.py`) |
 | Rewrite fact check (no invented numbers, tools or companies) | `app/factcheck.py`, with one repair call to Claude |
-| Question read aloud, feedback spoken in Hindi/Tamil/Kannada | Gnani **Timbre** text-to-speech |
+| Question read aloud, feedback spoken in Hindi/Tamil/Kannada | Gnani **Timbre** text-to-speech, streamed |
+| Feedback spoken while it's still being written | `app/live.py`: Claude streams the feedback first; each sentence goes to Timbre's streaming voice at once, so the coach starts talking about 3 s after you finish (the full score lands at about 7 s) |
 | Suggested answer spoken in your own voice | Gnani voice cloning (your own consented sample) |
 
 Score = 0.5 content + 0.25 fluency + 0.25 delivery (typed answers: content and fluency only).
@@ -33,14 +34,18 @@ Open http://localhost:8020. In the Claude desktop app you can also start the `bo
 | Variable | What for | Without it |
 | - | - | - |
 | `ANTHROPIC_API_KEY` | Claude coaching (from console.anthropic.com; set a monthly spend limit there) | template questions and sample coaching |
-| `CLAUDE_MODEL` | defaults to `claude-haiku-4-5`; `claude-haiku-5-5` also works | |
+| `CLAUDE_MODEL` | defaults to `claude-haiku-5-5`; `claude-haiku-4-5` also works | |
+| `CLAUDE_EFFORT` / `CLAUDE_THINKING` | how much Haiku 5.5 thinks first (default `low` / on); `CLAUDE_THINKING=off` is ~0.7 s faster, slightly less consistent | |
 | `VACHANA_API_KEY` | Gnani speech-to-text, voices and voice cloning (app.gnani.ai) | type answers; no audio |
 | `STT_MODEL` / `STT_LANGUAGE` / `STT_FORMAT` | Prisma model and output style (default `prisma-v3.0`, `indic-auto`, `codemix`) | |
 | `TTS_ENGLISH_VOICE` / `TTS_ENGLISH_LANGUAGE` | voice that reads questions and model answers (default `Poorvi` / `en-IN`) | |
 | `TTS_VOICE_HI_IN`, `TTS_VOICE_TA_IN`, ... | override the feedback voice per language | |
 
-Cost: every feedback screen shows the Claude tokens and dollars for that answer. One answer is roughly 4k input + 1k output tokens on Haiku 4.5 ($1 / $5 per million), about 1 US cent
-(under ₹1); preparing a session costs about the same.
+Cost: every feedback screen shows the Claude tokens and dollars for that answer. On Haiku 5.5 ($0.10 / $0.50 per
+million tokens) one answer is about $0.001 (3k input + 1-1.5k output, including the occasional repair call), a tenth
+of a rupee; preparing a session costs about the same. Haiku 5.5 doesn't accept `temperature: 0`, so the same answer
+can now differ by a point on one rubric line between runs (specifics and the speaking scores are rules, so they
+don't move).
 
 ## Tests
 

@@ -5,9 +5,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import JD, RESUME, prepare, score
+from conftest import JD, RESUME, install_fake_claude, prepare, score
 from app import claude, config, limits, main, safety
-
 
 
 @pytest.fixture(scope="module")
@@ -72,12 +71,7 @@ def test_student_text_cannot_close_its_tag():
 @pytest.fixture
 def fake_claude(monkeypatch):
     def install(result):
-        monkeypatch.setattr(claude, "settings", dataclasses.replace(config.settings, claude_enabled=True))
-        sent = []
-        messages = SimpleNamespace(parse=lambda **kw: sent.append(kw) or SimpleNamespace(
-            parsed_output=result, stop_reason="end_turn"))
-        monkeypatch.setattr(claude, "_client", lambda: SimpleNamespace(messages=messages))
-        return sent
+        return install_fake_claude(monkeypatch, result).calls
     return install
 
 

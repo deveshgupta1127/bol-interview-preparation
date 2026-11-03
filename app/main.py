@@ -14,15 +14,16 @@ import logging
 import os
 import re
 import time
-from typing import Literal
+from typing import Iterator, Literal
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
+from starlette.background import BackgroundTask
 
-from . import audio, claude, factcheck, gnani, language, limits, pdf, pii, scoring
+from . import audio, claude, factcheck, gnani, language, limits, live, pdf, pii, scoring
 from .config import LANGUAGES, ROUNDS, settings
 
 log = logging.getLogger("bol")
@@ -172,6 +173,7 @@ class AnswerContext(BaseModel):
     skills: list[str] = Field(default_factory=list, max_length=40)
     resume_text: str = Field(min_length=1, max_length=16000)
     feedback_language: str = "hi-IN"
+    speak_feedback: bool = False  # with a streamed reply: read the feedback aloud as it's written
 
 
 def _clean_key(value: str | None) -> str | None:
@@ -182,11 +184,17 @@ def _clean_key(value: str | None) -> str | None:
     return value
 
 
+NDJSON = "application/x-ndjson"
+
+
 @app.post("/api/score")
 def score(request: Request, context: str = Form(...), audio_file: UploadFile | None = File(None),
-          text: str = Form(""), idempotency_key: str | None = Header(None)):
+          text: str = Form(""), idempotency_key: str | None = Header(None), accept: str | None = Header(None)):
     """One answer turn: transcribe (if spoken), measure, coach. A retried upload with the same Idempotency-Key
-    gets the first result instead of being scored (and paid for) twice."""
+    gets the first result instead of being scored (and paid for) twice.
+
+    With "Accept: application/x-ndjson" the reply streams (see live.py): the transcript first, then the feedback
+    read aloud while Claude writes it, then the result. Otherwise it is one JSON object."""
     try:
         ctx = AnswerContext.model_validate_json(context)
     except ValidationError:
@@ -195,24 +203,47 @@ def score(request: Request, context: str = Form(...), audio_file: UploadFile | N
         raise HTTPException(422, "Unknown round or feedback language.")
     client = _client(request)
     key = _clean_key(idempotency_key)
+    streamed = NDJSON in (accept or "")
     if key and (done := limits.replies.get(f"{client}:{key}")):
-        return done
+        return StreamingResponse(live.replay(done), media_type=NDJSON) if streamed else done
     limits.check_heavy(client)
     limits.check_daily(client, "answers")
-    reply = _score_answer(ctx, audio_file, text)
-    if key:
-        limits.replies.put(f"{client}:{key}", reply)
-    return reply
+    heard = _hear(ctx, audio_file, text)  # problems with the recording are plain HTTP errors, before any stream
+    remember = (lambda reply: limits.replies.put(f"{client}:{key}", reply)) if key else (lambda reply: None)
+    if not streamed:
+        reply = _coach(ctx, heard)
+        remember(reply)
+        return reply
+    events = live.run(heard["transcript"], lambda on_feedback: _coach(ctx, heard, on_feedback),
+                      ctx.feedback_language, _feedback_voice(ctx, client), remember)
+    return StreamingResponse(events, media_type=NDJSON, headers={"X-Accel-Buffering": "no"})
+
+
+def _feedback_voice(ctx: AnswerContext, client: str) -> str | None:
+    """The voice to read the feedback aloud as it's written, or None (not asked for, no voice, or over a limit:
+    the student can still press Listen later)."""
+    if not ctx.speak_feedback or not gnani.enabled() or limits.budget.voices_paused():
+        return None
+    voice = gnani.ENGLISH_VOICE if ctx.feedback_language == "en-IN" else gnani.voice_for(ctx.feedback_language)
+    if not voice:
+        return None
+    try:
+        limits.check_daily(client, "speech")
+    except HTTPException:
+        return None
+    return voice
 
 
 def _score_answer(ctx: AnswerContext, audio_file: UploadFile | None, text: str) -> dict:
+    return _coach(ctx, _hear(ctx, audio_file, text))
+
+
+def _hear(ctx: AnswerContext, audio_file: UploadFile | None, text: str) -> dict:
+    """Transcribe (if spoken) and measure the answer. Everything _coach needs, or an HTTP error."""
     started = time.monotonic()
-    notes: list[str] = []
     acoustic: dict = {}
     timings: dict = {}
-    resume = pii.redact(ctx.resume_text)[:15000]
     skills = [s[:40] for s in ctx.skills]
-    requirements = [r[:120] for r in ctx.requirements]
 
     if audio_file and audio_file.filename:
         data = audio_file.file.read(MAX_AUDIO_BYTES + 1)
@@ -257,6 +288,18 @@ def _score_answer(ctx: AnswerContext, audio_file: UploadFile | None, text: str) 
     lang = language.analyse(transcript, acoustic.get("duration_s"), acoustic.get("hesitations", 0))
     delivery_score, delivery_notes = scoring.delivery(acoustic, lang)
     fluency_score, fluency_notes = scoring.fluency(lang, spoken)
+    return {"started": started, "timings": timings, "acoustic": acoustic, "transcript": transcript, "lang": lang,
+            "delivery": (delivery_score, delivery_notes), "fluency": (fluency_score, fluency_notes)}
+
+
+def _coach(ctx: AnswerContext, heard: dict, on_feedback=None) -> dict:
+    """Score the content with Claude (or the stand-in) and build the reply. on_feedback: see claude.evaluate."""
+    notes: list[str] = []
+    timings, acoustic, transcript, lang = heard["timings"], heard["acoustic"], heard["transcript"], heard["lang"]
+    delivery_score, delivery_notes = heard["delivery"]
+    fluency_score, fluency_notes = heard["fluency"]
+    resume = pii.redact(ctx.resume_text)[:15000]
+    requirements = [r[:120] for r in ctx.requirements]
     speech_notes = delivery_notes + fluency_notes + [f"Said \"{h['said']}\": {h['why']}" for h in
                                                      lang["indian_english"]]
 
@@ -269,7 +312,7 @@ def _score_answer(ctx: AnswerContext, audio_file: UploadFile | None, text: str) 
     try:
         if limits.budget.claude_paused():
             raise claude.LLMError("this month's coaching budget is used up")
-        ev = claude.evaluate(**eval_args, usage=usage)
+        ev = claude.evaluate(**eval_args, usage=usage, on_feedback=on_feedback)
         source = "claude"
         missing = factcheck.unsupported(ev.rewrite, resume, transcript, ctx.question)
         if missing:
@@ -296,7 +339,7 @@ def _score_answer(ctx: AnswerContext, audio_file: UploadFile | None, text: str) 
 
     parts = {"content": scoring.content(rubric), "fluency": fluency_score, "delivery": delivery_score}
     follow_up = ev.follow_up if ctx.kind == "main" else ""
-    timings["total_s"] = round(time.monotonic() - started, 2)
+    timings["total_s"] = round(time.monotonic() - heard["started"], 2)
     log.info("answer scored, timings %s claude usage %s", json.dumps(timings), json.dumps(used))
     return {
         "transcript": transcript, "duration_s": acoustic.get("duration_s"), "acoustics": acoustic,
@@ -319,6 +362,7 @@ class SpeakRequest(BaseModel):
     language: str = "en-IN"
     sig: str = Field(max_length=64)
     embedding: dict | None = None  # the student's cloned voice, for kind "answer"
+    stream: bool = False  # raw PCM ("audio/pcm;rate=22050") as Gnani speaks, instead of one WAV at the end
 
 
 @app.post("/api/speak")
@@ -332,27 +376,42 @@ def speak(body: SpeakRequest, request: Request):
         raise HTTPException(503, "Voices are paused for this month. Read the text instead.")
     limits.check_heavy(_client(request))
     limits.check_daily(_client(request), "speech")
-    text = body.text
+    text, clone = body.text, None
+    language, voice, speed = gnani.ENGLISH_LANGUAGE, gnani.ENGLISH_VOICE, 0.95
+    if body.kind == "feedback":
+        language = body.language
+        voice = gnani.ENGLISH_VOICE if body.language == "en-IN" else gnani.voice_for(body.language)
+        if not voice:
+            raise HTTPException(404, f"No voice set up for {LANGUAGES.get(body.language)} yet; read it instead.")
+    elif body.kind == "answer":
+        text = text.replace("[", "").replace("]", "")
+        if body.embedding and body.embedding.get("embedding"):
+            if len(json.dumps(body.embedding)) > 500_000:
+                raise HTTPException(413, "That voice data is too large. Set up your voice again.")
+            clone = body.embedding
     try:
-        if body.kind == "question":
-            data = gnani.synthesize(text, gnani.ENGLISH_LANGUAGE, gnani.ENGLISH_VOICE, speed=0.95)
-        elif body.kind == "feedback":
-            voice = gnani.ENGLISH_VOICE if body.language == "en-IN" else gnani.voice_for(body.language)
-            if not voice:
-                raise HTTPException(404, f"No voice set up for {LANGUAGES.get(body.language)} yet; read it instead.")
-            data = gnani.synthesize(text, body.language, voice)
-        else:
-            text = text.replace("[", "").replace("]", "")
-            if body.embedding and body.embedding.get("embedding"):
-                if len(json.dumps(body.embedding)) > 500_000:
-                    raise HTTPException(413, "That voice data is too large. Set up your voice again.")
-                data = gnani.synthesize_clone(text, body.embedding)
-            else:
-                data = gnani.synthesize(text, gnani.ENGLISH_LANGUAGE, gnani.ENGLISH_VOICE, speed=0.95)
+        if body.stream:
+            speech = gnani.stream_clone(text, clone) if clone else gnani.stream_speech(text, language, voice, speed)
+            chunks = iter(speech)
+            first = next(chunks, None)  # Gnani's own errors arrive before the first audio: report them properly
+            if first is None:
+                raise gnani.GnaniError("No audio came back. Try again.")
+            limits.budget.add(timbre_chars=len(text))
+            return StreamingResponse(_rest_of(first, chunks), media_type=f"audio/pcm;rate={gnani.PCM_RATE}",
+                                     background=BackgroundTask(speech.close))
+        data = gnani.synthesize_clone(text, clone) if clone else gnani.synthesize(text, language, voice, speed=speed)
     except gnani.GnaniError as exc:
         raise HTTPException(503, str(exc))
     limits.budget.add(timbre_chars=len(text))
     return Response(content=data, media_type="audio/wav")
+
+
+def _rest_of(first: bytes, chunks: Iterator[bytes]) -> Iterator[bytes]:
+    yield first
+    try:
+        yield from chunks
+    except gnani.GnaniError as exc:  # the browser plays what it got
+        log.warning("speech stream stopped: %s", exc)
 
 
 @app.post("/api/voice-clone", status_code=201)

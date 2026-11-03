@@ -1,9 +1,10 @@
-"""Claude Haiku 4.5, called only from this backend (the browser never sees the key).
+"""Claude Haiku 5.5, called only from this backend (the browser never sees the key).
 
 Three jobs:
   prepare()  - read resume + JD once per session: skills, claims, gaps, resume tips and 5 questions
   evaluate() - score one answer on the rubric, write a fact-safe rewrite, tips, a follow-up and the
-               mother-tongue feedback, all in one call to keep feedback under 15 s
+               mother-tongue feedback, all in one call. The feedback is written first and streamed out
+               sentence by sentence (on_feedback), so it can be spoken while the rest is still being written
   repair()   - rewrite again without facts the fact check couldn't find in the resume or answer
 
 With no ANTHROPIC_API_KEY, stand-in versions (stub_*) run so the app works offline for development.
@@ -12,7 +13,7 @@ import json
 import logging
 import re
 from functools import lru_cache
-from typing import Literal
+from typing import Callable, Literal
 
 import anthropic
 from pydantic import BaseModel, ValidationError
@@ -29,7 +30,8 @@ class LLMError(RuntimeError):
 
 
 # US dollars per million input / output tokens (https://docs.claude.com/en/docs/about-claude/pricing).
-PRICES = {"claude-haiku-4-5": (1.0, 5.0)}
+# Haiku 5.5's rate is for prompts up to 100K tokens; Bol's are under 10K.
+PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-haiku-4-5": (1.0, 5.0)}
 
 
 class Usage:
@@ -96,7 +98,10 @@ class Criterion(BaseModel):
 
 
 class EvalReply(BaseModel):
-    """What Claude fills in when judging an answer. "specifics" is scored by rules.specifics(), not by Claude."""
+    """What Claude fills in when judging an answer. "specifics" is scored by rules.specifics(), not by Claude.
+    Claude writes the fields in this order, so native_feedback comes first and can be spoken while the rest is
+    being written."""
+    native_feedback: str
     answered: Criterion
     structure: Criterion
     jd_fit: Criterion
@@ -104,7 +109,6 @@ class EvalReply(BaseModel):
     tips: list[str]
     rewrite: str
     follow_up: str
-    native_feedback: str
 
 
 class Evaluation(BaseModel):
@@ -234,44 +238,61 @@ def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic(max_retries=2, timeout=45.0)
 
 
-def _request(prompt: str, max_tokens: int) -> dict:
+def _request(prompt: str, schema: type[BaseModel] | None, max_tokens: int) -> dict:
+    """The request body. With a schema, Claude's reply is guaranteed to be JSON of that shape."""
     kwargs = {"model": settings.claude_model, "max_tokens": max_tokens, "system": SYSTEM,
               "messages": [{"role": "user", "content": prompt}]}
+    output_config: dict = {}
+    if schema is not None:
+        output_config["format"] = {"type": "json_schema", "schema": anthropic.transform_schema(schema)}
     if settings.claude_model.startswith("claude-haiku-4-5"):
-        # Same answer -> same score. Haiku 4.5 accepts temperature; newer models reject non-default values.
+        # Same answer -> same score. Haiku 4.5 takes temperature (and has no effort setting).
         kwargs["extra_body"] = {"temperature": 0}
+    else:
+        # Haiku 5.5 rejects temperature 0 (scores rest on the rubric and rules.py instead) and thinks by default;
+        # effort sets how much.
+        output_config["effort"] = settings.claude_effort
+        if not settings.claude_thinking:
+            kwargs["thinking"] = {"type": "disabled"}
+    if output_config:
+        kwargs["output_config"] = output_config
     return kwargs
 
 
-def _json_fallback(prompt: str, schema: type[BaseModel], max_tokens: int, usage: Usage | None) -> BaseModel:
-    """For accounts/models without structured outputs: ask for JSON and validate it here."""
-    kwargs = _request(prompt + "\n\nReply with only a JSON object matching this JSON schema:\n"
-                      + json.dumps(schema.model_json_schema()), max_tokens)
-    response = _client().messages.create(**kwargs)
-    if usage:
-        usage.add(getattr(response, "usage", None))
-    text = next((b.text for b in response.content if b.type == "text"), "")
-    match = re.search(r"\{.*\}", text, re.S)
-    if not match:
-        raise LLMError("Claude returned no JSON")
-    return schema.model_validate_json(match.group(0))
+def _generate(kwargs: dict, on_text: Callable[[str], None] | None) -> tuple[str, str | None, object]:
+    """Streams one reply. on_text gets each piece of text as it arrives. Returns (text, stop reason, usage)."""
+    with _client().messages.stream(**kwargs) as stream:
+        for piece in stream.text_stream:
+            if on_text:
+                on_text(piece)
+        message = stream.get_final_message()
+    text = "".join(b.text for b in message.content if b.type == "text")  # thinking blocks come first; skip them
+    return text, message.stop_reason, getattr(message, "usage", None)
 
 
-def _call(prompt: str, schema: type[BaseModel], max_tokens: int, usage: Usage | None = None) -> BaseModel:
+def _call(prompt: str, schema: type[BaseModel], max_tokens: int, usage: Usage | None = None,
+          on_text: Callable[[str], None] | None = None) -> BaseModel:
     if not settings.claude_enabled:
         raise LLMError("ANTHROPIC_API_KEY is not set")
     try:
         try:
-            response = _client().messages.parse(output_format=schema, **_request(prompt, max_tokens))
-        except anthropic.BadRequestError:
-            return _json_fallback(prompt, schema, max_tokens, usage)
+            text, stop, used = _generate(_request(prompt, schema, max_tokens), on_text)
+        except anthropic.BadRequestError as exc:
+            # An account or model without structured outputs: ask for JSON in words and validate it here.
+            log.warning("structured output refused (%s); asking for plain JSON", exc.message)
+            text, stop, used = _generate(_request(prompt + "\n\nReply with only a JSON object matching this JSON "
+                                                  "schema:\n" + json.dumps(schema.model_json_schema()), None,
+                                                  max_tokens), None)
         if usage:
-            usage.add(getattr(response, "usage", None))
-        if response.stop_reason == "max_tokens":
+            usage.add(used)
+        if stop == "refusal":
+            raise LLMError("Claude declined to answer this one")
+        if stop == "max_tokens":
             raise LLMError("Claude's reply was cut off")
-        if response.parsed_output is None:
-            raise LLMError(f"Claude returned no result (stop reason: {response.stop_reason})")
-        return response.parsed_output
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            raise LLMError(f"Claude returned no result (stop reason: {stop})")
+        return schema.model_validate_json(match.group(0))
     except anthropic.RateLimitError as exc:
         raise LLMError("Claude rate limit reached; try again in a minute") from exc
     except anthropic.APIStatusError as exc:
@@ -280,8 +301,63 @@ def _call(prompt: str, schema: type[BaseModel], max_tokens: int, usage: Usage | 
         raise LLMError(f"Claude API error {exc.status_code}") from exc
     except anthropic.APIConnectionError as exc:
         raise LLMError("Couldn't reach Claude") from exc
+    except anthropic.APIError as exc:  # e.g. an error event in the middle of the stream
+        log.warning("Claude stream error: %s", exc)
+        raise LLMError("Claude stopped part-way; try again") from exc
     except ValidationError as exc:
         raise LLMError("Claude's reply didn't match the expected shape") from exc
+
+
+class FeedbackStream:
+    """Reads native_feedback out of Claude's JSON while it is still being written and hands on each finished
+    sentence (or several at once), so the voice can start before the rest of the evaluation is done."""
+
+    KEY = re.compile(r'"native_feedback"\s*:\s*"')
+    SENTENCE_END = re.compile(r"(?<=[.!?।॥])\s+")
+
+    def __init__(self, on_sentence: Callable[[str], None]) -> None:
+        self.on_sentence, self.buf, self.given, self.closed = on_sentence, "", 0, False
+
+    def feed(self, piece: str) -> None:
+        if self.closed:
+            return
+        self.buf += piece
+        text, closed = self._text()
+        new = text[self.given:]
+        if not closed:
+            ends = [m.end() for m in self.SENTENCE_END.finditer(new)]
+            if not ends:
+                return
+            new = new[:ends[-1]]
+        self.given += len(new)
+        self.closed = closed
+        if new.strip():
+            try:
+                self.on_sentence(new.strip())
+            except Exception:  # the voice is a bonus; never let it break the evaluation
+                log.exception("feedback voice callback failed")
+                self.closed = True
+
+    def _text(self) -> tuple[str, bool]:
+        """The feedback string so far (decoded) and whether its closing quote has arrived."""
+        start = self.KEY.search(self.buf)
+        if not start:
+            return "", False
+        i = j = start.end()
+        end = None
+        while j < len(self.buf):
+            if self.buf[j] == "\\":
+                j += 2
+                continue
+            if self.buf[j] == '"':
+                end = j
+                break
+            j += 1
+        raw = self.buf[i:end] if end is not None else re.sub(r"\\(u[0-9a-fA-F]{0,3})?$", "", self.buf[i:])
+        try:
+            return json.loads('"' + raw + '"'), end is not None
+        except ValueError:
+            return "", False
 
 
 # ---------- guardrails on what Claude writes (see safety.py) ----------
@@ -317,7 +393,7 @@ def prepare(resume: str, jd: str, round_type: str, role: str = "", usage: Usage 
     prompt = PREPARE.format(round=ROUNDS[round_type], resume=safety.strip_tags(resume)[:12000],
                             jd=safety.strip_tags(jd)[:8000], role=safety.one_line(role, 120),
                             opener=OPENERS[round_type].text)
-    reply = _call(prompt, PrepReply, 4000, usage)
+    reply = _call(prompt, PrepReply, 8000, usage)  # room for Haiku 5.5's thinking and ~30% more tokens per word
     if len(reply.questions) < 2:
         raise LLMError("Claude returned too few questions")
     claims = [c if isinstance(c, str) else c.text for c in reply.claims][:6]
@@ -330,7 +406,10 @@ def prepare(resume: str, jd: str, round_type: str, role: str = "", usage: Usage 
 
 
 def evaluate(*, question: str, why: str, round_type: str, role: str, requirements: list[str], resume: str,
-             answer: str, speech_notes: list[str], feedback_language: str, usage: Usage | None = None) -> Evaluation:
+             answer: str, speech_notes: list[str], feedback_language: str, usage: Usage | None = None,
+             on_feedback: Callable[[str], None] | None = None) -> Evaluation:
+    """on_feedback, if given, gets the mother-tongue feedback a sentence or more at a time while Claude writes it
+    (unchecked: the caller runs its own checks before speaking it)."""
     # Questions and follow-ups were written by Claude from student text, so they are cleaned like student text.
     notes = [safety.one_line(n) for n in speech_notes]
     note = ("Speaking measurements from the recording:\n- " + "\n- ".join(notes)) if notes \
@@ -343,7 +422,8 @@ def evaluate(*, question: str, why: str, round_type: str, role: str, requirement
                              speech_note=note, language=LANGUAGES.get(feedback_language, "Hindi"),
                              script_rule=_script_rule(feedback_language),
                              specifics=spec_score, specifics_reason=spec_reason)
-    reply = _call(prompt, EvalReply, 3000, usage)
+    stream = FeedbackStream(on_feedback) if on_feedback else None
+    reply = _call(prompt, EvalReply, 6000, usage, on_text=stream.feed if stream else None)
     native = reply.native_feedback
     if not rules.in_own_script(native, feedback_language):
         native = _fix_script(native, feedback_language, usage)
@@ -366,7 +446,7 @@ def _fix_script(feedback: str, lang: str, usage: Usage | None) -> str:
     prompt = SCRIPT_FIX.format(language=LANGUAGES[lang], script=rules.script_name(lang),
                                feedback=safety.strip_tags(feedback))
     try:
-        fixed = _call(prompt, ScriptFix, 1200, usage).native_feedback
+        fixed = _call(prompt, ScriptFix, 2000, usage).native_feedback
     except LLMError:
         return feedback
     return fixed if rules.in_own_script(fixed, lang) else feedback
@@ -376,7 +456,7 @@ def repair(rewrite: str, missing: list[str], resume: str, answer: str, usage: Us
     prompt = REPAIR.format(missing=", ".join(safety.one_line(m, 80) for m in missing[:10]),
                            resume=safety.strip_tags(resume)[:12000], answer=safety.strip_tags(answer)[:6000],
                            rewrite=safety.strip_tags(rewrite))
-    fixed = _call(prompt, RewriteFix, 1200, usage).rewrite
+    fixed = _call(prompt, RewriteFix, 2000, usage).rewrite
     _refuse_unsafe(fixed)
     return safety.clean(fixed, 1500)
 

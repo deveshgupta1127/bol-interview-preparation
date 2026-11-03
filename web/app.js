@@ -122,6 +122,94 @@ async function toWav(blob) {
   return encodeWav(rendered.getChannelData(0), rate);
 }
 
+// ---------- streamed speech ----------
+// Gnani sends raw 16-bit mono PCM while it speaks; each piece is scheduled right after the previous one, so playback
+// starts with the first piece instead of after the whole clip.
+
+let playCtx = null;
+function audioCtx() { // call from a click first: browsers only allow sound after a user gesture
+  if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (playCtx.state === "suspended") playCtx.resume().catch(() => {});
+  return playCtx;
+}
+
+function makePcmPlayer(rate, onEnd) {
+  const ctx = audioCtx();
+  const LEAD = 0.25; // seconds buffered before starting, so a slow network doesn't stutter at once
+  let at = 0, first = 0, started = false, finished = false, stopped = false, playing = 0, carry = null;
+  let waiting = [], waitingSeconds = 0;
+  const sources = [];
+  const done = () => { if (!stopped) { stopped = true; onEnd?.(); } };
+  const schedule = (floats) => {
+    const buffer = ctx.createBuffer(1, floats.length, rate);
+    buffer.copyToChannel(floats, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer; src.connect(ctx.destination);
+    if (at < ctx.currentTime + 0.02) at = ctx.currentTime + 0.05;
+    if (!first) first = at;
+    src.start(at); at += buffer.duration; playing++;
+    src.onended = () => { playing--; if (finished && !playing) done(); };
+    sources.push(src);
+  };
+  const flush = () => { started = true; waiting.forEach(schedule); waiting = []; };
+  return {
+    push(bytes) {
+      if (stopped) return;
+      let data = bytes;
+      if (carry) { data = new Uint8Array(carry.length + bytes.length); data.set(carry); data.set(bytes, carry.length); carry = null; }
+      if (data.length % 2) { carry = data.slice(-1); data = data.slice(0, -1); }
+      if (!data.length) return;
+      const pcm = new Int16Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.length));
+      const floats = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) floats[i] = pcm[i] / 32768;
+      if (started) schedule(floats);
+      else { waiting.push(floats); waitingSeconds += floats.length / rate; if (waitingSeconds >= LEAD) flush(); }
+    },
+    end() { if (finished) return; finished = true; if (!started) flush(); if (!playing) done(); },
+    stop() { stopped = true; sources.forEach((s) => { try { s.stop(); } catch { /* not started */ } }); },
+    progress() { return first && at > first ? Math.min(1, Math.max(0, (ctx.currentTime - first) / (at - first))) : 0; },
+  };
+}
+
+// Plays a streamed audio response as it arrives. onEnd runs when the last piece has played.
+function playPcm(res, rate, { onEnd, track } = {}) {
+  let ticker = null;
+  const player = makePcmPlayer(rate, () => { clearInterval(ticker); onEnd?.(); });
+  const reader = res.body.getReader();
+  if (track) ticker = setInterval(() => { track.style.width = (100 * player.progress()) + "%"; }, 120);
+  (async () => {
+    try {
+      for (;;) { const { value, done } = await reader.read(); if (done) break; player.push(value); }
+    } catch { /* stopped or dropped: play what arrived */ }
+    player.end();
+  })();
+  return { stop() { player.stop(); reader.cancel().catch(() => {}); clearInterval(ticker); } };
+}
+
+// The feedback spoken while Claude writes it (see Store.scoreAnswer). It keeps playing when the page changes to
+// the feedback screen, where the Listen button becomes its Stop button.
+function liveVoice() {
+  let player = null;
+  const voice = {
+    live: true, button: null, label: "",
+    start(rate) { player = makePcmPlayer(rate, () => voice.finish()); },
+    push(bytes) { player?.push(bytes); },
+    end() { player ? player.end() : voice.finish(); },
+    cancel() { player?.stop(); voice.finish(); },
+    stop() { player?.stop(); voice.finish(); },
+    finish() {
+      if (voice.button) { voice.button.innerHTML = voice.label; voice.button.disabled = false; }
+      if (nowPlaying === voice) nowPlaying = null;
+    },
+    attach(button) { // show "Stop" on the feedback page's Listen button while it plays
+      voice.button = button; voice.label = button.innerHTML; button.innerHTML = "■ Stop"; button.disabled = false;
+    },
+  };
+  nowPlaying?.stop();
+  nowPlaying = voice;
+  return voice;
+}
+
 // Mic recorder. Reports level (dBFS), long pauses and elapsed time while recording; onStop gets a 16 kHz WAV.
 function makeRecorder({ maxSeconds, onTick, onStop }) {
   let stream, recorder, chunks, ctx, raf, started, tick;
@@ -208,8 +296,22 @@ async function play(url, button, track) {
   }
   const label = button.innerHTML;
   button.disabled = true; button.innerHTML = '<span class="spinner"></span> Loading';
+  audioCtx(); // unlock sound while we're still inside the click
   try {
     const res = await api(url);
+    const rate = Number(((res.headers.get("content-type") || "").match(/^audio\/pcm.*rate=(\d+)/) || [])[1]);
+    if (rate) { // streaming from Gnani: starts with the first piece
+      let handle = null;
+      const stop = () => {
+        handle?.stop(); button.innerHTML = label; button.disabled = false;
+        if (track) track.style.width = "0%";
+        if (nowPlaying?.button === button) nowPlaying = null;
+      };
+      handle = playPcm(res, rate, { onEnd: stop, track });
+      nowPlaying = { stop, button };
+      button.innerHTML = "■ Stop"; button.disabled = false;
+      return;
+    }
     const audio = new Audio(URL.createObjectURL(await res.blob()));
     const stop = () => {
       audio.pause(); button.innerHTML = label; button.disabled = false;
@@ -402,8 +504,20 @@ async function interviewPage(id) {
     start.disabled = end.disabled = true;
     setStatus("Scoring…", "busy");
     $("#transcript").innerHTML = `<p class="note"><span class="spinner"></span> ${spoken ? "Prisma is transcribing, then your answer is scored…" : "Scoring your answer…"}</p>`;
+    // The feedback is read aloud while Claude writes it, when this language has a voice and the student wants it.
+    const voice = me.speech && !me.voices_paused && me.speak_feedback !== false && hasVoice(me.feedback_language)
+      ? liveVoice() : null;
+    const live = {
+      voice,
+      onTranscript: (text) => {
+        setStatus(voice ? "Coaching · your feedback is starting" : "Coaching…", "busy");
+        $("#transcript").innerHTML = `<span class="label">${spoken ? "What you said · Gnani Prisma" : "What you typed"}</span>
+          <div class="seg">${esc(text)}</div>
+          <p class="note"><span class="spinner"></span> Claude is scoring your answer${voice ? " and your coach is about to speak" : ""}…</p>`;
+      },
+    };
     // The same key on a retry tells the server it's the same answer, so it's never scored (or paid for) twice.
-    const send = (key) => api(`/api/questions/${id}/attempts`, { method: "POST", body, headers: { "Idempotency-Key": key } });
+    const send = (key) => api(`/api/questions/${id}/attempts`, { method: "POST", body, headers: { "Idempotency-Key": key }, live });
     try {
       const key = crypto.randomUUID();
       let a;
@@ -414,6 +528,7 @@ async function interviewPage(id) {
       refreshStreak();
       location.hash = `#/a/${a.id}`;
     } catch (err) {
+      voice?.cancel();
       showError(err);
       setStatus("Ready"); start.disabled = false;
       $("#transcript").innerHTML = '<p class="note">Try again, or type your answer.</p>';
@@ -443,8 +558,9 @@ async function interviewPage(id) {
       setStatus("Listening", "on"); start.disabled = true; end.disabled = false;
     } catch (err) { showError(err); }
   };
-  end.onclick = () => { end.disabled = true; rec.stop(); };
-  $("#typed").onsubmit = (e) => { e.preventDefault(); submit(new FormData(e.target), false); };
+  // audioCtx() inside the click: the feedback voice starts later, and browsers only allow sound after a gesture.
+  end.onclick = () => { audioCtx(); end.disabled = true; rec.stop(); };
+  $("#typed").onsubmit = (e) => { e.preventDefault(); audioCtx(); submit(new FormData(e.target), false); };
   cleanup = () => rec.abort();
 }
 
@@ -521,6 +637,7 @@ async function feedbackPage(id) {
     </div>`;
   $("#hear-fb").onclick = (e) => play(`/api/attempts/${id}/feedback-audio`, e.currentTarget);
   $("#hear-model").onclick = (e) => play(`/api/attempts/${id}/model-answer-audio`, e.currentTarget, $("#voice-track"));
+  if (nowPlaying?.attach) nowPlaying.attach($("#hear-fb")); // the coach is still speaking this feedback
 }
 
 // ---------- 4 Compare ----------
@@ -743,6 +860,8 @@ async function settingsPage() {
         <div class="field"><label for="name">Your name</label><input id="name" value="${esc(me.name)}" placeholder="First name"></div>
         <div class="field"><label for="lang">Feedback language</label><select id="lang">${langOptions(me.feedback_language)}</select></div>
         <div class="field"><label for="idate">Interview date</label><input type="date" id="idate" value="${me.interview_date || ""}"></div>
+        <label class="check"><input type="checkbox" id="autospeak" ${me.speak_feedback !== false ? "checked" : ""}>
+          <span>Speak my feedback as soon as I finish answering (it starts while the rest is still being scored)</span></label>
         <span class="note" id="saved">&nbsp;</span>
       </div>
       <div class="card"><span class="label">Services</span><dl class="kv">
@@ -790,6 +909,7 @@ async function settingsPage() {
   $("#name").onchange = (e) => saveMe({ name: e.target.value }).then(saved).catch(showError);
   $("#lang").onchange = (e) => saveMe({ feedback_language: e.target.value }).then(saved).catch(showError);
   $("#idate").onchange = (e) => saveMe({ interview_date: e.target.value }).then(saved).catch(showError);
+  $("#autospeak").onchange = (e) => saveMe({ speak_feedback: e.target.checked }).then(saved).catch(showError);
 }
 
 // ---------- motion: page enter, bars filling, numbers counting up ----------
@@ -830,8 +950,9 @@ function animateIn() {
 
 async function route() {
   if (cleanup) { cleanup(); cleanup = null; }
-  if (nowPlaying) nowPlaying.stop();
   const [, page, id] = location.hash.split("/");
+  // Leaving a page stops its audio, except the coach's live feedback on the way to its own feedback screen.
+  if (nowPlaying && !(nowPlaying.live && !nowPlaying.button && page === "a")) nowPlaying.stop();
   const nav = { progress: "progress", voice: "voice", settings: "settings" }[page] || "practice";
   document.querySelectorAll(".side nav a").forEach((a) => a.classList.toggle("on", a.dataset.nav === nav));
   view.classList.remove("enter");

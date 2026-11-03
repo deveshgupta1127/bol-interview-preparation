@@ -6,11 +6,14 @@ The key allows ONE active request at a time, across all three services (tested 3
 gets 429 "Only 1 active request is allowed at a time"). So every call here waits for its turn in this process, and
 retries with a short back-off when another process using the same key (another replica) is busy.
 """
+import base64
 import json
+import logging
 import os
 import re
 import threading
 import time
+from typing import Iterator
 
 import httpx
 import numpy as np
@@ -24,6 +27,10 @@ FEEDBACK_VOICES = {"hi-IN": "Nalini", "ta-IN": "Asmita", "kn-IN": "Saanvi"}
 ENGLISH_VOICE = os.getenv("TTS_ENGLISH_VOICE", "Poorvi")
 ENGLISH_LANGUAGE = os.getenv("TTS_ENGLISH_LANGUAGE", "en-IN")
 WAV_CONFIG = {"sample_rate": 22050, "num_channels": 1, "sample_width": 2, "encoding": "linear_pcm", "container": "wav"}
+# Streamed speech: the same audio with no WAV header, so each chunk can be played as it arrives.
+PCM_RATE = WAV_CONFIG["sample_rate"]
+PCM_CONFIG = {**WAV_CONFIG, "container": "raw"}
+log = logging.getLogger("bol.gnani")
 
 
 class GnaniError(RuntimeError):
@@ -149,3 +156,88 @@ def synthesize_clone(text: str, embedding: dict) -> bytes:
     response = _send("Voice clone TTS", "/api/v1/tts/inference", 90, json=payload)
     _raise_for(response, "Voice clone TTS")
     return response.content
+
+
+# ---------- streamed speech (Server-Sent Events: https://docs.gnani.ai/api/TTS/tts-sse) ----------
+
+class Speech:
+    """Raw 16-bit mono PCM at PCM_RATE, chunk by chunk, while Gnani is still speaking. Holds this process's Gnani
+    turn until the stream ends or close() is called (iterating to the end closes it)."""
+
+    def __init__(self, response: httpx.Response, client: httpx.Client, what: str) -> None:
+        self._response, self._client, self.what, self._open = response, client, what, True
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            event = None
+            for line in self._response.iter_lines():
+                if line.startswith("event:"):
+                    event = line[6:].strip()
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    data = json.loads(line[5:])
+                except ValueError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if event == "error" or data.get("type") == "error" or data.get("success") is False:
+                    raise GnaniError(f"{self.what} failed: {data.get('message') or data}")
+                audio = data.get("audio") or (data.get("data") or {}).get("audio")
+                if audio:
+                    yield base64.b64decode(audio)
+        except httpx.HTTPError as exc:
+            raise GnaniError(f"{self.what} stream dropped: {exc}") from exc
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._open:
+            self._open = False
+            self._response.close()
+            self._client.close()
+            _turn.release()
+
+    def __del__(self) -> None:  # last resort if a stream is dropped unread: give the turn back
+        self.close()
+
+
+def _open_stream(what: str, payload: dict, timeout: float = 60) -> Speech:
+    """Opens a speech stream when it's our turn; on 429 (key busy elsewhere) waits and tries again. Errors that
+    Gnani reports before any audio raise GnaniError here."""
+    headers = {**_headers(), "Accept": "text/event-stream"}
+    for pause in (*BUSY_RETRIES, None):
+        if not _turn.acquire(timeout=TURN_WAIT_S):
+            raise GnaniError(f"{what} is busy with other students. Try again in a minute.")
+        client = httpx.Client(timeout=timeout)
+        try:
+            request = client.build_request("POST", f"{settings.vachana_base_url}/api/v1/tts/sse", json=payload,
+                                           headers=headers)
+            response = client.send(request, stream=True)
+        except httpx.HTTPError as exc:
+            client.close()
+            _turn.release()
+            raise GnaniError(f"{what} unreachable: {exc}") from exc
+        if response.status_code < 400:
+            return Speech(response, client, what)
+        response.read()
+        response.close()
+        client.close()
+        _turn.release()
+        if response.status_code != 429 or pause is None:
+            _raise_for(response, what)
+        time.sleep(pause)
+    raise AssertionError("unreachable")
+
+
+def stream_speech(text: str, language: str, voice: str, speed: float = 0.95) -> Speech:
+    """Timbre voice, streamed."""
+    return _open_stream("Timbre TTS", {"text": text, "voice": voice, "model": "timbre-v2.5", "language": language,
+                                       "speed": max(0.85, min(1.15, speed)), "audio_config": PCM_CONFIG})
+
+
+def stream_clone(text: str, embedding: dict) -> Speech:
+    """The student's cloned voice, streamed."""
+    return _open_stream("Voice clone TTS", {"text": text, "model": "vachana-vc-v1", "speaker_embedding": embedding,
+                                            "audio_config": PCM_CONFIG}, timeout=90)

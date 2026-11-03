@@ -62,6 +62,10 @@ class Settings:
     vachana_api_key: str
     vachana_base_url: str
     web_dir: Path
+    # Haiku 5.5 thinks before answering by default; effort sets how much (low = fastest, still good on this rubric).
+    # CLAUDE_THINKING=off skips thinking for about 0.7 s faster feedback, at some cost in consistency.
+    claude_effort: str = "low"
+    claude_thinking: bool = True
     signing_key: bytes = b""
     serve_web: bool = True  # local runs serve web/ from the API; on Azure, Static Web Apps serves it
     cors_origins: tuple[str, ...] = ()
@@ -79,8 +83,10 @@ class Settings:
 
 def load_settings() -> Settings:
     return Settings(
-        claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5"),
+        claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-5-5"),
         claude_enabled=bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")),
+        claude_effort=os.getenv("CLAUDE_EFFORT", "low"),
+        claude_thinking=_bool("CLAUDE_THINKING", True),
         vachana_api_key=os.getenv("VACHANA_API_KEY", ""),
         vachana_base_url=os.getenv("VACHANA_BASE_URL", "https://api.vachana.ai").rstrip("/"),
         web_dir=ROOT / "web",

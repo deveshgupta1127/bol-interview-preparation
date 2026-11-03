@@ -44,3 +44,59 @@ def score(client, prep, text=None, i=0, files=None, headers=None, **ctx):
     if text is not None:
         data["text"] = text
     return client.post("/api/score", data=data, files=files, headers=headers)
+
+
+# ---------- a fake Claude (no network, no cost) ----------
+
+class FakeStream:
+    """What client.messages.stream(...) returns: the reply's text in small pieces, then the final message."""
+
+    def __init__(self, text, stop_reason, usage):
+        self.text, self.stop_reason, self.usage = text, stop_reason, usage
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    @property
+    def text_stream(self):
+        for i in range(0, len(self.text), 7):
+            yield self.text[i:i + 7]
+
+    def get_final_message(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(content=[SimpleNamespace(type="thinking", thinking=""),
+                                        SimpleNamespace(type="text", text=self.text)],
+                               stop_reason=self.stop_reason, usage=self.usage)
+
+
+class FakeMessages:
+    """Each call streams the next prepared reply (a pydantic model, sent as its JSON); the last one repeats."""
+
+    def __init__(self, *results, stop_reason="end_turn", usage=None):
+        self.results, self.stop_reason, self.usage, self.calls = list(results), stop_reason, usage, []
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        text = result if isinstance(result, str) else result.model_dump_json()
+        return FakeStream(text, self.stop_reason, self.usage)
+
+
+def install_fake_claude(monkeypatch, *results, model=None, **kwargs):
+    """Route app.claude to a FakeMessages; returns it (its .calls holds every request body)."""
+    import dataclasses
+    from types import SimpleNamespace
+    from app import claude, config
+    changes = {"claude_enabled": True, **({"claude_model": model} if model else {})}
+    monkeypatch.setattr(claude, "settings", dataclasses.replace(config.settings, **changes))
+    messages = FakeMessages(*results, **kwargs)
+    monkeypatch.setattr(claude, "_client", lambda: SimpleNamespace(messages=messages))
+    return messages
+
+
+def schema_fields(call):
+    """The field names of the JSON schema a request asked Claude to follow, in order."""
+    return list(call["output_config"]["format"]["schema"]["properties"])

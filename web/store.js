@@ -6,7 +6,7 @@
 
 const Store = (() => {
   const KEY = "bol.v1";
-  const blank = () => ({ profile: { name: "", feedback_language: "hi-IN", interview_date: null }, voice: null,
+  const blank = () => ({ profile: { name: "", feedback_language: "hi-IN", interview_date: null, speak_feedback: true }, voice: null,
     sessions: {}, questions: {}, attempts: {} });
   let db = load();
   let config = null;
@@ -39,7 +39,56 @@ const Store = (() => {
       }
       throw new Error(msg);
     }
-    return type.includes("json") ? res.json() : res;
+    return type.startsWith("application/json") ? res.json() : res; // streams (ndjson, audio) come back as-is
+  }
+
+  // ---------- streamed replies ----------
+
+  const fromBase64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+  // 16-bit mono PCM pieces -> a WAV file, so a streamed clip can be replayed without asking Gnani again.
+  function wavBlob(pieces, rate) {
+    const size = pieces.reduce((n, p) => n + p.length, 0) & ~1;
+    const head = new DataView(new ArrayBuffer(44));
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) head.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, "RIFF"); head.setUint32(4, 36 + size, true); str(8, "WAVE"); str(12, "fmt ");
+    head.setUint32(16, 16, true); head.setUint16(20, 1, true); head.setUint16(22, 1, true); head.setUint32(24, rate, true);
+    head.setUint32(28, rate * 2, true); head.setUint16(32, 2, true); head.setUint16(34, 16, true); str(36, "data");
+    head.setUint32(40, size, true);
+    return new Blob([head, ...pieces], { type: "audio/wav" });
+  }
+
+  // Reads newline-delimited JSON events (see app/live.py). Resolves with the result as soon as it arrives and keeps
+  // reading the rest (the end of the spoken feedback) in the background.
+  function readEvents(res, on) {
+    return new Promise((resolve, reject) => {
+      const reader = res.body.getReader();
+      const text = new TextDecoder();
+      let buf = "", result = null;
+      (async () => {
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += text.decode(value, { stream: true });
+            let nl;
+            while ((nl = buf.indexOf("\n")) >= 0) {
+              const line = buf.slice(0, nl).trim();
+              buf = buf.slice(nl + 1);
+              if (!line) continue;
+              const ev = JSON.parse(line);
+              if (ev.type === "error") throw new Error(ev.detail || "Scoring failed. Please try again.");
+              if (ev.type === "result") { result = ev.data; resolve(result); } else on[ev.type]?.(ev);
+            }
+          }
+          if (!result) throw new Error("The connection dropped before your feedback arrived. Please try again.");
+        } catch (err) {
+          if (!result) reject(err);
+        } finally {
+          on.close?.();
+        }
+      })();
+    });
   }
 
   // ---------- reading the stored data in the shapes the pages expect ----------
@@ -85,6 +134,7 @@ const Store = (() => {
   async function updateMe(patch) {
     if (!config) config = await server("/api/config");
     if (patch.name != null) db.profile.name = String(patch.name).trim().slice(0, 80);
+    if (patch.speak_feedback != null) db.profile.speak_feedback = !!patch.speak_feedback;
     if (patch.feedback_language != null) {
       if (!config.languages[patch.feedback_language]) throw new Error("Unsupported language");
       db.profile.feedback_language = patch.feedback_language;
@@ -127,14 +177,30 @@ const Store = (() => {
       history: attemptsOf(q.id).map((a) => attemptJson(a)), ...place(q) };
   }
 
+  // opts.live (optional): { onTranscript(text), voice: { start(rate), push(bytes), end(), cancel() } } to show the
+  // transcript and play the feedback while Claude is still writing it.
   async function scoreAnswer(questionId, opts) {
     const q = db.questions[questionId] || missing("That question");
     const s = db.sessions[q.session_id];
     const body = opts.body;
+    const live = opts.live || {};
     body.set("context", JSON.stringify({ question: q.text, why: q.why, kind: q.kind, round_type: s.round_type,
       target_role: s.target_role || "", requirements: s.profile.jd_requirements || [], skills: s.profile.skills || [],
-      resume_text: s.resume_text, feedback_language: db.profile.feedback_language }));
-    const r = await server("/api/score", { method: "POST", body, headers: opts.headers });
+      resume_text: s.resume_text, feedback_language: db.profile.feedback_language, speak_feedback: !!live.voice }));
+    const res = await server("/api/score", { method: "POST", body,
+      headers: { ...opts.headers, Accept: "application/x-ndjson" } });
+    let saved = null, spokenOk = false, rate = 0;
+    const pcm = [];
+    const keepVoice = () => { // the streamed feedback becomes this answer's "Listen" clip
+      if (saved && spokenOk && pcm.length) { clips.set(`${saved.id}/feedback`, wavBlob(pcm, rate)); pcm.length = 0; }
+    };
+    const r = res instanceof Response ? await readEvents(res, {
+      transcript: (e) => live.onTranscript?.(e.text),
+      voice: (e) => { rate = e.rate; live.voice?.start(e.rate); },
+      audio: (e) => { const bytes = fromBase64(e.data); pcm.push(bytes); live.voice?.push(bytes); },
+      voice_end: (e) => { spokenOk = e.ok; if (e.stale) live.voice?.cancel(); keepVoice(); },
+      close: () => live.voice?.end(),
+    }) : res;
     const a = { id: uid(), question_id: q.id, number: attemptsOf(q.id).length + 1, transcript: r.transcript,
       duration_s: r.duration_s, acoustics: r.acoustics, language: r.language, scores: r.scores, content: r.content,
       rewrite: r.rewrite, tips: r.tips, native_feedback: r.native_feedback, feedback_language: r.feedback_language,
@@ -147,6 +213,8 @@ const Store = (() => {
       db.questions[follow.id] = follow;
     }
     save();
+    saved = a;
+    keepVoice();
     return { ...attemptJson(a, previousOf(a)), follow_up_question_id: follow ? follow.id : null, timings: r.timings };
   }
 
@@ -159,13 +227,23 @@ const Store = (() => {
       session_id: s.id, round_label: s.round_label, follow_up_question_id: follow ? follow.id : null };
   }
 
+  // A clip already heard this visit plays from memory (audio/wav). Otherwise it streams from Gnani
+  // (audio/pcm;rate=...) so it starts playing straight away, and a copy is kept once it has fully arrived.
   async function speak(cacheKey, request) {
-    if (!clips.has(cacheKey)) {
-      const res = await server("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request) });
-      clips.set(cacheKey, await res.blob());
+    if (clips.has(cacheKey)) return new Response(clips.get(cacheKey), { headers: { "content-type": "audio/wav" } });
+    const res = await server("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...request, stream: true }) });
+    const type = res.headers.get("content-type") || "";
+    const rate = Number((type.match(/rate=(\d+)/) || [])[1]);
+    if (!rate || !res.body) {
+      const blob = await res.blob();
+      clips.set(cacheKey, blob);
+      return new Response(blob, { headers: { "content-type": type || "audio/wav" } });
     }
-    return new Response(clips.get(cacheKey), { headers: { "content-type": "audio/wav" } });
+    const [play, copy] = res.body.tee();
+    new Response(copy).arrayBuffer().then((buf) => clips.set(cacheKey, wavBlob([new Uint8Array(buf)], rate)))
+      .catch(() => {}); // a broken stream isn't kept; the next Listen asks again
+    return new Response(play, { headers: { "content-type": type } });
   }
 
   function progress() {

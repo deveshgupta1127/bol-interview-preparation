@@ -1,10 +1,8 @@
 """Deterministic rules (app/rules.py) and how they replace parts of Claude's job."""
-import dataclasses
-from types import SimpleNamespace
-
 import pytest
+from conftest import install_fake_claude, schema_fields
 
-from app import claude, config, rules
+from app import claude, rules
 
 
 # ---------- skills dictionary ----------
@@ -71,12 +69,7 @@ def test_same_answer_same_score():
 @pytest.fixture
 def fake(monkeypatch):
     def install(result):
-        monkeypatch.setattr(claude, "settings", dataclasses.replace(config.settings, claude_enabled=True))
-        sent = []
-        messages = SimpleNamespace(parse=lambda **kw: sent.append(kw) or SimpleNamespace(
-            parsed_output=result, stop_reason="end_turn"))
-        monkeypatch.setattr(claude, "_client", lambda: SimpleNamespace(messages=messages))
-        return sent
+        return install_fake_claude(monkeypatch, result).calls
     return install
 
 
@@ -91,7 +84,7 @@ def test_prepare_uses_rules_for_opener_skills_and_claims(fake):
     assert prep.questions[0].text == rules.OPENERS["technical"][0] and len(prep.questions) == 5
     assert prep.skills == ["Python", "Flask", "MySQL"]
     assert [c.strength for c in prep.claims] == ["specific", "vague"]
-    assert sent[0]["output_format"] is claude.PrepReply
+    assert schema_fields(sent[0]) == list(claude.PrepReply.model_fields)
     prompt = sent[0]["messages"][0]["content"]
     assert "exactly 4 questions" in prompt and rules.OPENERS["technical"][0] in prompt
 
@@ -143,24 +136,11 @@ def test_feedback_script(text, lang, ok):
     assert rules.in_own_script(text, lang) is ok
 
 
-class Replies:
-    """A fake Claude that answers each call with the next prepared reply."""
-
-    def __init__(self, *results):
-        self.results, self.sent = list(results), []
-
-    def parse(self, **kw):
-        self.sent.append(kw)
-        return SimpleNamespace(parsed_output=self.results.pop(0), stop_reason="end_turn")
-
-
 def _evaluate_with(monkeypatch, *results, lang="hi-IN"):
-    monkeypatch.setattr(claude, "settings", dataclasses.replace(config.settings, claude_enabled=True))
-    messages = Replies(*results)
-    monkeypatch.setattr(claude, "_client", lambda: SimpleNamespace(messages=messages))
+    messages = install_fake_claude(monkeypatch, *results)
     ev = claude.evaluate(question="Q", why="w", round_type="hr", role="", requirements=[], resume="r",
                          answer="I built a Flask app for 300 students.", speech_notes=[], feedback_language=lang)
-    return ev, messages.sent
+    return ev, messages.calls
 
 
 def _reply(native):
@@ -173,7 +153,7 @@ def test_romanised_feedback_is_rewritten_in_script(monkeypatch):
     ev, sent = _evaluate_with(monkeypatch, _reply(ROMANISED), claude.ScriptFix(native_feedback=DEVANAGARI))
     assert ev.native_feedback == DEVANAGARI and len(sent) == 2
     assert "Devanagari" in sent[0]["messages"][0]["content"]  # the main prompt names the script
-    assert sent[1]["output_format"] is claude.ScriptFix
+    assert schema_fields(sent[1]) == ["native_feedback"]  # the short script-fix call
 
 
 def test_feedback_already_in_script_costs_no_extra_call(monkeypatch):

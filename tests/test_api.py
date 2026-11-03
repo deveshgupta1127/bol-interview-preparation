@@ -194,3 +194,106 @@ def test_server_keeps_nothing(client):
     import app as package
     names = {p.stem for p in __import__("pathlib").Path(package.__file__).parent.glob("*.py")}
     assert not names & {"db", "models", "auth", "tts_cache"}
+
+
+# ---------- streamed replies: the feedback spoken while Claude writes it ----------
+
+class FakeSpeech:
+    """Stands in for gnani.Speech: a few PCM chunks, and a record of close()."""
+
+    def __init__(self, chunks):
+        self.chunks, self.closed = chunks, False
+
+    def __iter__(self):
+        yield from self.chunks
+
+    def close(self):
+        self.closed = True
+
+
+def events(response):
+    import json
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+
+NDJSON = {"Accept": "application/x-ndjson"}
+HINDI = "आपने canteen app अच्छे से समझाया। अब अपना role साफ़ बताइए। आप सही रास्ते पर हैं।"
+
+
+def eval_reply(native):
+    c = claude.Criterion(score=2, reason="ok")
+    return claude.EvalReply(native_feedback=native, answered=c, structure=c, jd_fit=c, strength="Clear.",
+                            tips=["Add a number."], rewrite="I built the canteen app in Flask.", follow_up="")
+
+
+@pytest.fixture
+def spoken(monkeypatch, speech_on):
+    """Fake streamed voice; returns the texts it was asked to speak."""
+    said = []
+    monkeypatch.setattr(gnani, "stream_speech", lambda text, lang, voice, speed=0.95:
+                        said.append((text, lang, voice)) or FakeSpeech([b"\x01\x00" * 50, b"\x02\x00" * 50]))
+    return said
+
+
+def test_streamed_score_without_voice(client):
+    p = prepare(client)
+    r = score(client, p, "I built the canteen app in Flask for 300 students.", headers=NDJSON)
+    assert r.status_code == 200 and r.headers["content-type"].startswith("application/x-ndjson")
+    ev = events(r)
+    assert [e["type"] for e in ev] == ["transcript", "result", "voice_end"]
+    assert ev[0]["text"].startswith("I built") and ev[1]["data"]["scores"]["overall"] is not None
+    assert ev[2]["ok"] is False  # nothing was spoken
+
+
+def test_streamed_score_speaks_the_feedback_as_it_is_written(client, monkeypatch, spoken):
+    from conftest import install_fake_claude
+    p = prepare(client)
+    install_fake_claude(monkeypatch, eval_reply(HINDI))
+    r = score(client, p, "I built the canteen app in Flask for 300 students.", headers=NDJSON, speak_feedback=True)
+    ev = events(r)
+    kinds = [e["type"] for e in ev]
+    assert kinds[0] == "transcript" and kinds[-1] == "voice_end" and "result" in kinds
+    assert ev[kinds.index("voice")]["rate"] == gnani.PCM_RATE and kinds.count("audio") >= 2
+    result = ev[kinds.index("result")]["data"]
+    assert " ".join(text for text, _, _ in spoken) == result["native_feedback"] == HINDI
+    assert all(lang == "hi-IN" and voice == "Nalini" for _, lang, voice in spoken)
+    assert ev[-1]["ok"] is True and ev[-1]["stale"] is False  # the browser may keep this recording for Listen
+
+
+def test_unsafe_feedback_is_never_spoken(client, monkeypatch, spoken):
+    from conftest import install_fake_claude
+    p = prepare(client)
+    install_fake_claude(monkeypatch, eval_reply("तू हरामी है। अगली बार अच्छा बोलना।"))
+    ev = events(score(client, p, "I built the canteen app in Flask.", headers=NDJSON, speak_feedback=True))
+    assert not spoken and "audio" not in [e["type"] for e in ev]
+    result = next(e["data"] for e in ev if e["type"] == "result")
+    assert result["scores"]["content_source"] == "stand-in" and ev[-1]["ok"] is False
+
+
+def test_streamed_retry_replays_the_first_result(client):
+    p = prepare(client)
+    headers = {**NDJSON, "Idempotency-Key": "stream-retry-01"}
+    first = events(score(client, p, "I built the canteen app in Flask.", headers=headers))
+    again = events(score(client, p, "I built the canteen app in Flask.", headers=headers))
+    result = lambda ev: next(e["data"] for e in ev if e["type"] == "result")
+    assert result(first) == result(again)
+
+
+def test_speak_streams_raw_audio(client, spoken):
+    p = prepare(client)
+    q = p["questions"][0]
+    r = client.post("/api/speak", json={"kind": "question", "text": q["text"], "sig": q["sig"], "stream": True})
+    assert r.status_code == 200 and r.headers["content-type"] == f"audio/pcm;rate={gnani.PCM_RATE}"
+    assert r.content == b"\x01\x00" * 50 + b"\x02\x00" * 50
+    assert spoken == [(q["text"], gnani.ENGLISH_LANGUAGE, gnani.ENGLISH_VOICE)]
+
+
+def test_speak_stream_reports_gnani_errors(client, speech_on, monkeypatch):
+    p = prepare(client)
+    q = p["questions"][0]
+
+    def broken(*a, **k):
+        raise gnani.GnaniError("Timbre TTS failed (400): unknown voice")
+    monkeypatch.setattr(gnani, "stream_speech", broken)
+    r = client.post("/api/speak", json={"kind": "question", "text": q["text"], "sig": q["sig"], "stream": True})
+    assert r.status_code == 503 and "unknown voice" in r.json()["detail"]
